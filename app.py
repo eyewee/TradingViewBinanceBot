@@ -7,14 +7,15 @@ from binance.error import ClientError
 app = Flask(__name__)
 
 # --- SECURE CONFIGURATION ---
-# We do NOT type keys here. We pull them from the Server Environment.
 API_KEY = os.environ.get('BINANCE_API_KEY')
 API_SECRET = os.environ.get('BINANCE_API_SECRET')
 WEBHOOK_PASSPHRASE = os.environ.get('WEBHOOK_PASSPHRASE')
 
 # Connect to TESTNET explicitly
 BASE_URL = 'https://testnet.binance.vision'
-client = Spot(key=API_KEY, secret=API_SECRET, base_url=BASE_URL)
+
+# --- FIXED LINE BELOW (api_key and api_secret) ---
+client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
 
 # Helper: Round down to avoid "Filter Failure" (Precision errors)
 def round_step_size(quantity, step_size):
