@@ -1,3 +1,5 @@
 flask
 binance-connector
 gunicorn
+gspread
+oauth2client
