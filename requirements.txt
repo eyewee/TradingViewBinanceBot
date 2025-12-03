@@ -3,3 +3,4 @@ binance-connector
 gunicorn
 gspread
 oauth2client
+urllib3==1.26.15
