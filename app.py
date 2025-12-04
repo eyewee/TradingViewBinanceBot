@@ -20,14 +20,32 @@ BASE_URL = 'https://testnet.binance.vision'
 GOOGLE_JSON = os.environ.get('GOOGLE_CREDENTIALS')
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# --- CLIENTS ---
+# --- GLOBAL CLIENTS ---
 client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
 
+# CACHING THE GOOGLE CONNECTION (THE FIX)
+GOOGLE_CLIENT = None
+
 def get_sheet():
-    creds_dict = json.loads(GOOGLE_JSON)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client_gs = gspread.authorize(creds)
-    return client_gs.open("TradingBotLog").worksheet("Dashboard")
+    global GOOGLE_CLIENT
+    try:
+        # 1. Try to use existing connection
+        if GOOGLE_CLIENT is None:
+            print("Initializing Google Connection...")
+            creds_dict = json.loads(GOOGLE_JSON)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            GOOGLE_CLIENT = gspread.authorize(creds)
+        
+        # 2. Test if connection is still alive by opening the sheet
+        return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
+        
+    except Exception as e:
+        print(f"Google Connection Stale/Error ({e}). Reconnecting...")
+        # 3. Force Re-connect if expired/failed
+        creds_dict = json.loads(GOOGLE_JSON)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        GOOGLE_CLIENT = gspread.authorize(creds)
+        return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
 
 # --- HELPERS ---
 def get_usdt_balance():
@@ -55,34 +73,30 @@ def round_step_size(quantity, step_size):
     precision = int(round(-math.log(float(step_size), 10), 0))
     return float(round(quantity - (quantity % float(step_size)), precision))
 
-# --- NEW: MONEY MANAGEMENT LOGIC ---
+# --- MONEY MANAGEMENT LOGIC ---
 def calculate_trade_size(current_usdt_balance):
     try:
         sheet = get_sheet()
-        # Read D2 (Dedicated Cap) and E2 (% Reinvest)
-        # format: [['1000', '90']]
-        settings = sheet.get('D2:E2')
+        # Optimized: Get D2 and E2 in one API call
+        settings = sheet.get('D2:E2') 
         
-        if not settings or len(settings) == 0 or len(settings[0]) < 2:
-            print("Sheet settings empty, using default logic")
-            return None # Fallback to Pine Script %
+        if not settings or len(settings) == 0:
+            return None
             
-        dedicated_cap = float(settings[0][0])
-        reinvest_pct = float(settings[0][1])
+        row_vals = settings[0]
+        # Handle cases where user might leave E2 empty
+        dedicated_cap = float(row_vals[0]) if len(row_vals) > 0 else 0.0
+        reinvest_pct = float(row_vals[1]) if len(row_vals) > 1 else 100.0
         
-        # Logic: 
-        # 1. We can't spend money we don't have. (Min of Cap vs Wallet)
+        # Logic: Min of (Dedicated Cap vs Real Wallet)
         effective_cap = min(dedicated_cap, current_usdt_balance)
         
-        # 2. Calculate Order Size
         usdt_to_spend = effective_cap * (reinvest_pct / 100.0)
-        
-        print(f"Sheet Settings -> Cap: {dedicated_cap}, Pct: {reinvest_pct}%. Calc Amount: {usdt_to_spend}")
         return usdt_to_spend
 
     except Exception as e:
-        print(f"Money Management Error: {e}")
-        return None # Fallback
+        print(f"Money Mgmt Error: {e}")
+        return None
 
 # --- BACKGROUND TASKS ---
 def update_dashboard():
@@ -90,9 +104,7 @@ def update_dashboard():
         bal = get_usdt_balance()
         price = get_btc_price()
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sheet = get_sheet()
-        # Updates A2, B2, C2 (Time, Bal, Price)
-        sheet.update('A2:C2', [[ts, bal, price]]) 
+        get_sheet().update('A2:C2', [[ts, bal, price]]) 
     except Exception as e:
         print(f"Dash Error: {e}")
 
@@ -108,8 +120,7 @@ t.start()
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(force=True)
-    if data.get('passphrase') != WEBHOOK_PASSPHRASE:
-        return jsonify({"error": "Unauthorized"}), 401
+    if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
     # Clean Symbol
     raw_s = data['symbol'].upper().replace("/", "")
@@ -127,12 +138,11 @@ def webhook():
         if side == 'BUY':
             usdt_bal = get_usdt_balance()
             
-            # --- APPLY MONEY MANAGEMENT ---
-            # Try to get size from Sheet. If fail, use Pine Script %
+            # 1. Money Management from Sheet
             amt = calculate_trade_size(usdt_bal)
             
+            # 2. Fallback to Pine Script % if Sheet fails/empty
             if amt is None: 
-                # Fallback to Pine Script logic
                 pct = float(data.get('percentage', 100))
                 amt = usdt_bal * (pct / 100.0)
 
@@ -142,15 +152,11 @@ def webhook():
                 resp = client.new_order(symbol=symbol, side="BUY", type="MARKET", quoteOrderQty=amt)
                 status = "Filled"
             else:
-                status = "Skipped: Low Bal/Cap"
-                resp = {"status": "skipped", "msg": f"Calculated Amt {amt} < 10"}
+                status = "Skipped: Low Bal"
+                resp = {"status": "skipped", "msg": f"Amt {amt} < 10"}
 
         elif side == 'SELL':
-            # Sell logic usually sells ALL coins or a %, doesn't typically use 'Dedicated Capital' 
-            # as that concept applies to USDT risk.
-            # Here we assume sell 100% of coin if triggered
-            
-            # 1. Get Coin Balance
+            # Sell Logic: Sells 100% of coin balance found
             base = symbol.replace("USDT","")
             coin_bal = 0.0
             for a in client.account()['balances']:
@@ -159,8 +165,8 @@ def webhook():
             step = get_symbol_step_size(symbol)
             qty = round_step_size(coin_bal, step)
             
-            # Simple check
-            if qty * float(sent_price) > 5: # Approx check
+            # Approx check using Sent Price or 1.0 if Market
+            if qty * float(sent_price if sent_price != 'Market' else 1) > 5:
                 resp = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=qty)
                 status = "Filled"
             else:
@@ -173,12 +179,10 @@ def webhook():
             exec_qty = resp['fills'][0]['qty']
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Ensure row matches headers: Time, Symbol, Side, Req%, SentPrice, ExecPrice, ExecQty, Status
+        # Columns: Time, Symbol, Side, Type, SentPrice, ExecPrice, ExecQty, Status
         row = [ts, symbol, side, "Sheet/Dyn", sent_price, exec_price, exec_qty, status]
         
-        sheet = get_sheet()
-        sheet.append_row(row)
-        update_dashboard() # Force instant update
+        get_sheet().append_row(row)
         
         return jsonify(resp)
 
@@ -193,29 +197,25 @@ def webhook():
 @app.route('/cli', methods=['POST'])
 def cli():
     data = request.json
-    if data.get('passphrase') != WEBHOOK_PASSPHRASE: 
-        return jsonify({"error": "Unauthorized"}), 401
+    if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
     method = data.get('method')
     params = data.get('params', {})
     
     try:
         # --- CUSTOM COMMAND: Get Sheet Settings ---
+        # Used by commander.py for "buy 50%" logic
         if method == "get_capital_status":
-            # 1. Get Wallet Balance
             usdt_bal = get_usdt_balance()
             
-            # 2. Get Sheet Settings
             sheet = get_sheet()
-            # Read D2 (Dedicated Cap)
             val = sheet.acell('D2').value
             dedicated_cap = float(val) if val else 0.0
             
-            # 3. Return Combined Data
             return jsonify({
                 "wallet_balance": usdt_bal,
                 "dedicated_cap": dedicated_cap,
-                "effective_cap": min(usdt_bal, dedicated_cap) # We can't spend more than we physically have
+                "effective_cap": min(usdt_bal, dedicated_cap)
             })
 
         # --- STANDARD BINANCE COMMANDS ---
@@ -228,4 +228,5 @@ def cli():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
+    # Remember to set Start Command in Render to: gunicorn app:app --timeout 120
     app.run(debug=True)
