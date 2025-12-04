@@ -206,13 +206,27 @@ def cli():
         if method == "get_capital_status":
             usdt_bal = get_usdt_balance()
             
+            # Fetch from Sheet
             sheet = get_sheet()
-            val = sheet.acell('D2').value
-            dedicated_cap = safe_float(val)
+            # We get both D2 and E2 in one go
+            vals = sheet.get('D2:E2') 
             
+            # Default values
+            dedicated_cap = 0.0
+            reinvest_pct = 100.0
+            
+            # DEBUG LOG (Check Render Logs if this fails)
+            print(f"Sheet Raw Values: {vals}")
+
+            if vals and len(vals) > 0:
+                row = vals[0]
+                if len(row) > 0: dedicated_cap = safe_float(row[0])
+                if len(row) > 1: reinvest_pct = safe_float(row[1])
+
             return jsonify({
                 "wallet_balance": usdt_bal,
                 "dedicated_cap": dedicated_cap,
+                "reinvest_pct": reinvest_pct,
                 "effective_cap": min(usdt_bal, dedicated_cap)
             })
 
@@ -221,6 +235,7 @@ def cli():
         else:
             return jsonify({"error": "Method not found"}), 400
     except Exception as e:
+        print(f"CLI Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
