@@ -31,9 +31,9 @@ GOOGLE_CLIENT = None
 # --- HELPER: Safe Float Conversion ---
 def safe_float(value, default=0.0):
     try:
-        # Removes '$' and ',' so "$1,000" becomes 1000.0
         if isinstance(value, str):
-            clean_val = value.replace('$', '').replace(',', '').strip()
+            # Replace '$', ',', AND ' ' (spaces)
+            clean_val = value.replace('$', '').replace(',', '').replace(' ', '').strip()
             if clean_val == "": return default
             return float(clean_val)
         return float(value)
