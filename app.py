@@ -142,26 +142,34 @@ def background_sync_loop():
         try:
             sheet = get_sheet()
             
-            # --- TASK A: Sync Settings (Every 10s) ---
+            # --- TASK A: Sync Settings ---
             data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
-            BOT_MEMORY['d2_cap'] = safe_float(data[0][0][0] if data[0] else 0)
-            BOT_MEMORY['e2_pct'] = safe_float(data[1][0][0] if data[1] else 100)
-            BOT_MEMORY['h4_cost'] = safe_float(data[2][0][0] if data[2] else 0)
-            BOT_MEMORY['f2_type'] = str(data[3][0][0]).upper() if (len(data) > 3 and data[3]) else "MARKET"
+            
+            # SAFE UNPACKING (Prevents IndexErrors on empty cells)
+            # data[0] is the result for D2. If cell is empty, it might be []
+            
+            val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
+            val_e2 = data[1][0][0] if (len(data) > 1 and data[1]) else 100
+            val_h4 = data[2][0][0] if (len(data) > 2 and data[2]) else 0
+            val_f2 = data[3][0][0] if (len(data) > 3 and data[3]) else "MARKET"
 
-            # --- TASK B: Update Dashboard Stats (Every 60s) ---
+            BOT_MEMORY['d2_cap'] = safe_float(val_d2)
+            BOT_MEMORY['e2_pct'] = safe_float(val_e2)
+            BOT_MEMORY['h4_cost'] = safe_float(val_h4)
+            BOT_MEMORY['f2_type'] = str(val_f2).upper()
+
+            # --- TASK B: Update Dashboard (Every 60s) ---
             if tick % 6 == 0:
                 usdt = get_balance("USDT")
-                btc = get_coin_price("BTCUSDT")
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.update('A2:C2', [[ts, usdt, btc]])
+                sheet.update('A2:B2', [[ts, usdt]])
                 
                 # Monitor H1 Coin
                 h1_val = sheet.acell('H1').value
                 if h1_val:
-                    monitor_symbol = h1_val.replace("USDT","").strip().upper()
-                    coin_bal = get_balance(monitor_symbol)
-                    sheet.update('H2', [[coin_bal]])
+                    mon_sym = h1_val.replace("USDT","").strip().upper()
+                    c_bal = get_balance(mon_sym)
+                    sheet.update('H2', [[c_bal]])
 
         except Exception as e:
             print(f"Sync Loop Error: {e}")
@@ -326,6 +334,26 @@ def cli():
     params = data.get('params', {})
     
     if method == "get_capital_status":
+        # Check if Memory is "Stale" (Default values)
+        if BOT_MEMORY['d2_cap'] == 0.0 and BOT_MEMORY['e2_pct'] == 100.0:
+            # FORCE REFRESH to verify connection
+            try:
+                sheet = get_sheet()
+                data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
+                
+                # Update Memory
+                # Safety check: Ensure list is deep enough
+                d2_val = data[0][0][0] if (len(data) > 0 and len(data[0]) > 0 and len(data[0][0]) > 0) else 0
+                e2_val = data[1][0][0] if (len(data) > 1 and len(data[1]) > 0 and len(data[1][0]) > 0) else 100
+                
+                BOT_MEMORY['d2_cap'] = safe_float(d2_val)
+                BOT_MEMORY['e2_pct'] = safe_float(e2_val)
+                # (We don't need to update H4/F2 here for status check)
+                
+            except Exception as e:
+                # This will print the ACTUAL error to your terminal
+                return jsonify({"error": f"Sheet Sync Failed: {str(e)}"}), 500
+
         # Read from Memory
         d2 = BOT_MEMORY['d2_cap']
         e2 = BOT_MEMORY['e2_pct']
