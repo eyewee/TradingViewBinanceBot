@@ -26,6 +26,14 @@ SCOPES = [
 client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
 GOOGLE_CLIENT = None
 
+# --- IN-MEMORY CACHE (The Speed Fix) ---
+BOT_MEMORY = {
+    "d2_cap": 0.0,
+    "e2_pct": 100.0,
+    "h4_cost": 0.0,
+    "f2_type": "MARKET"
+}
+
 # --- HELPERS ---
 def safe_float(value, default=0.0):
     try:
@@ -77,75 +85,89 @@ def round_step_size(quantity, step_size):
 # --- MONEY MANAGEMENT & COMPOUNDING ---
 def get_capital_settings():
     sheet = get_sheet()
-    # Reading D2 (Cap), E2 (Pct), H4 (Cost Basis)
-    data = sheet.batch_get(['D2', 'E2', 'H4'])
+    # CHANGED: Added 'F2' to the batch request
+    data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
     
     d2 = safe_float(data[0][0][0] if data[0] else 0)
     e2 = safe_float(data[1][0][0] if data[1] else 100)
     h4 = safe_float(data[2][0][0] if data[2] else 0) 
+    # NEW: Read Order Type string (default to Market if empty)
+    f2_type = data[3][0][0].upper() if (len(data) > 3 and data[3]) else "MARKET"
     
-    return d2, e2, h4
+    return d2, e2, h4, f2_type
 
-def update_compounding(sheet, side, usdt_value, coin_qty, symbol, old_h4, old_d2):
-    """Updates D2 (Capital) and H4 (Cost Basis) based on trade result."""
+def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
+    global BOT_MEMORY
+    
+    old_h4 = BOT_MEMORY['h4_cost']
+    old_d2 = BOT_MEMORY['d2_cap']
+    
+    new_d2 = old_d2
+    new_h4 = old_h4
+
+    if side == "BUY":
+        new_h4 = old_h4 + usdt_value
+    
+    elif side == "SELL":
+        base = symbol.replace("USDT", "")
+        rem_bal = get_balance(base)
+        total_held = rem_bal + coin_qty 
+        
+        if total_held > 0:
+            ratio = coin_qty / total_held 
+            cost_sold = old_h4 * ratio
+            pnl = usdt_value - cost_sold
+            new_d2 = old_d2 + pnl
+            new_h4 = old_h4 - cost_sold
+            if rem_bal < (coin_qty * 0.01): new_h4 = 0
+
+    # Update Memory Immediately
+    BOT_MEMORY['d2_cap'] = new_d2
+    BOT_MEMORY['h4_cost'] = new_h4
+    
+    # Update Sheet
     try:
-        new_d2 = old_d2
-        new_h4 = old_h4
-
-        if side == "BUY":
-            # Add cost to H4
-            new_h4 = old_h4 + usdt_value
-        
-        elif side == "SELL":
-            # Calculate PnL based on ratio of bag sold
-            base = symbol.replace("USDT", "")
-            remaining_bal = get_balance(base)
-            total_held_before = remaining_bal + coin_qty 
-            
-            if total_held_before > 0:
-                ratio = coin_qty / total_held_before 
-                cost_of_sold = old_h4 * ratio
-                pnl = usdt_value - cost_of_sold
-                
-                new_d2 = old_d2 + pnl
-                new_h4 = old_h4 - cost_of_sold
-                
-                # Reset if sold approx everything
-                if remaining_bal < (coin_qty * 0.01): new_h4 = 0
-
-        # Update Sheet
-        sheet.update('D2', [[new_d2]]) # New Capital
-        sheet.update('H3', [[new_d2]]) # Visual Helper
-        sheet.update('H4', [[new_h4]]) # Internal State
-
-        return new_d2
-        
-    except Exception as e:
-        print(f"Compounding Error: {e}")
-        return old_d2
+        sheet.update('D2', [[new_d2]])
+        sheet.update('H3', [[new_d2]]) 
+        sheet.update('H4', [[new_h4]])
+    except: pass
+    
+    return new_d2
 
 # --- BACKGROUND TASKS (H1/H2 Monitor) ---
-def update_dashboard_loop():
+def background_sync_loop():
+    global BOT_MEMORY
+    tick = 0 
     while True:
         try:
             sheet = get_sheet()
             
-            # 1. Basic Stats
-            usdt = get_balance("USDT")
-            btc = get_coin_price("BTCUSDT")
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            sheet.update('A2:C2', [[ts, usdt, btc]])
-            
-            # 2. H1/H2 Monitor
-            h1_val = sheet.acell('H1').value
-            if h1_val:
-                monitor_symbol = h1_val.replace("USDT","").strip().upper()
-                coin_bal = get_balance(monitor_symbol)
-                sheet.update('H2', [[coin_bal]])
+            # --- TASK A: Sync Settings (Every 10s) ---
+            data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
+            BOT_MEMORY['d2_cap'] = safe_float(data[0][0][0] if data[0] else 0)
+            BOT_MEMORY['e2_pct'] = safe_float(data[1][0][0] if data[1] else 100)
+            BOT_MEMORY['h4_cost'] = safe_float(data[2][0][0] if data[2] else 0)
+            BOT_MEMORY['f2_type'] = str(data[3][0][0]).upper() if (len(data) > 3 and data[3]) else "MARKET"
+
+            # --- TASK B: Update Dashboard Stats (Every 60s) ---
+            if tick % 6 == 0:
+                usdt = get_balance("USDT")
+                btc = get_coin_price("BTCUSDT")
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sheet.update('A2:C2', [[ts, usdt, btc]])
                 
+                # Monitor H1 Coin
+                h1_val = sheet.acell('H1').value
+                if h1_val:
+                    monitor_symbol = h1_val.replace("USDT","").strip().upper()
+                    coin_bal = get_balance(monitor_symbol)
+                    sheet.update('H2', [[coin_bal]])
+
         except Exception as e:
-            print(f"Loop Error: {e}")
-        time.sleep(60)
+            print(f"Sync Loop Error: {e}")
+        
+        tick += 1
+        time.sleep(5) # 10 seconds interval
 
 t = threading.Thread(target=update_dashboard_loop, daemon=True)
 t.start()
@@ -169,35 +191,47 @@ def webhook():
     final_cap = 0
     
     try:
-        # 1. Get Settings from Sheet
-        d2_cap, e2_pct, h4_cost = get_capital_settings()
-        final_cap = d2_cap # Default to current
+        # 1. READ FROM MEMORY (0ms Latency)
+        d2_cap = BOT_MEMORY['d2_cap']
+        e2_pct = BOT_MEMORY['e2_pct']
+        f2_type = BOT_MEMORY['f2_type']
+        h4_cost = BOT_MEMORY['h4_cost']
+        final_cap = d2_cap
         
-        # 2. Determine Trade Size
+        # 2. Determine Order Type
+        payload_type = data.get('type', 'MARKET').upper()
+        target_type = payload_type
+        
+        # LOGIC FIX: Ignore Sheet F2 if this is a Manual CLI command
+        is_manual_cli = "CLI" in reason
+        
+        # Only check Sheet override if NOT CLI
+        if not is_manual_cli and payload_type == 'MARKET' and 'LIMIT' in f2_type:
+            if sent_price != 'Market' and safe_float(sent_price) > 0:
+                target_type = 'LIMIT'
+
+        # 3. Determine Trade Size
         if side == 'BUY':
             bal = get_balance("USDT")
             eff_cap = min(d2_cap, bal)
             
-            # Check for "PercentAmount" override (CLI) or "percentage" (Pine)
             req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
-            
-            # Use the requested % for this specific trade
             amt = eff_cap * (req_pct / 100.0)
             
-            # -- LIMIT vs MARKET Logic --
-            order_type = data.get('type', 'MARKET').upper()
-            params = {"symbol": symbol, "side": "BUY", "type": order_type}
+            params = {"symbol": symbol, "side": "BUY", "type": target_type}
             
-            if order_type == 'LIMIT':
-                limit_price = float(data['limit_price'])
-                qty_coins = amt / limit_price 
+            if target_type == 'LIMIT':
+                # Use limit_price from payload OR sent_price from chart/F2 override
+                price_val = float(data.get('limit_price', sent_price))
+                
+                qty_coins = amt / price_val
                 step = get_symbol_step_size(symbol)
                 qty_coins = round_step_size(qty_coins, step)
                 
                 params['timeInForce'] = data.get('timeInForce', 'GTC')
                 params['quantity'] = qty_coins
-                params['price'] = str(limit_price)
-                amt = qty_coins * limit_price # Adjust actual USDT committed
+                params['price'] = str(price_val)
+                amt = qty_coins * price_val 
             else:
                 params['quoteOrderQty'] = round(amt, 2)
 
@@ -212,7 +246,6 @@ def webhook():
             base = symbol.replace("USDT","")
             coin_bal = get_balance(base)
             
-            # Verify Balance Logic
             if coin_bal == 0:
                 status = "Skipped: No Coins"
                 resp = {"status": "Skipped", "msg": "No coins to sell"}
@@ -220,15 +253,17 @@ def webhook():
                 step = get_symbol_step_size(symbol)
                 qty = round_step_size(coin_bal, step) 
                 
-                order_type = data.get('type', 'MARKET').upper()
-                
-                if order_type == 'LIMIT':
-                    limit_price = float(data['limit_price'])
-                    resp = client.new_order(symbol=symbol, side="SELL", type="LIMIT", 
-                                          quantity=qty, price=str(limit_price), timeInForce='GTC')
+                params = {"symbol": symbol, "side": "SELL", "type": target_type}
+
+                if target_type == 'LIMIT':
+                    price_val = float(data.get('limit_price', sent_price))
+                    params['quantity'] = qty
+                    params['price'] = str(price_val)
+                    params['timeInForce'] = data.get('timeInForce', 'GTC')
                 else:
-                    resp = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=qty)
-                    
+                    params['quantity'] = qty
+                
+                resp = client.new_order(**params)  
                 status = "Filled"
 
         # --- LOGGING & COMPOUNDING ---
@@ -250,7 +285,7 @@ def webhook():
 
         # Update D2/H4 (Compounding)
         if status.startswith("Filled"):
-            final_cap = update_compounding(sheet, side, usdt_value, float(exec_qty), symbol, h4_cost, d2_cap)
+            final_cap = update_compounding_after_trade(sheet, side, usdt_value, float(exec_qty), symbol)
 
         # Log Row
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -291,7 +326,9 @@ def cli():
     params = data.get('params', {})
     
     if method == "get_capital_status":
-        d2, e2, h4 = get_capital_settings()
+        # Read from Memory
+        d2 = BOT_MEMORY['d2_cap']
+        e2 = BOT_MEMORY['e2_pct']
         bal = get_balance("USDT")
         return jsonify({"dedicated_cap": d2, "reinvest_pct": e2, "wallet_balance": bal, "effective_cap": min(d2, bal)})
     
