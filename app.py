@@ -169,7 +169,7 @@ def background_sync_loop():
         tick += 1
         time.sleep(5) # 10 seconds interval
 
-t = threading.Thread(target=update_dashboard_loop, daemon=True)
+t = threading.Thread(target=background_sync_loop, daemon=True)
 t.start()
 
 # --- WEBHOOK ---
