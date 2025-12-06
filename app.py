@@ -26,7 +26,7 @@ SCOPES = [
 client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
 GOOGLE_CLIENT = None
 
-# --- IN-MEMORY CACHE (The Speed Fix) ---
+# --- IN-MEMORY CACHE ---
 BOT_MEMORY = {
     "d2_cap": 0.0,
     "e2_pct": 100.0,
@@ -52,7 +52,7 @@ def get_sheet():
             GOOGLE_CLIENT = gspread.service_account_from_dict(creds, scopes=SCOPES)
         return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
     except Exception:
-        # Force Reconnect on error
+        # Force Reconnect
         creds = json.loads(GOOGLE_JSON)
         GOOGLE_CLIENT = gspread.service_account_from_dict(creds, scopes=SCOPES)
         return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
@@ -64,11 +64,6 @@ def get_balance(asset):
             if a['asset'] == asset: return float(a['free'])
     except: pass
     return 0.0
-
-def get_coin_price(symbol):
-    try:
-        return float(client.ticker_price(symbol=symbol)['price'])
-    except: return 0.0
 
 def get_symbol_step_size(symbol):
     try:
@@ -82,21 +77,8 @@ def round_step_size(quantity, step_size):
     precision = int(round(-math.log(float(step_size), 10), 0))
     return float(round(quantity - (quantity % float(step_size)), precision))
 
-# --- MONEY MANAGEMENT & COMPOUNDING ---
-def get_capital_settings():
-    sheet = get_sheet()
-    # CHANGED: Added 'F2' to the batch request
-    data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
-    
-    d2 = safe_float(data[0][0][0] if data[0] else 0)
-    e2 = safe_float(data[1][0][0] if data[1] else 100)
-    h4 = safe_float(data[2][0][0] if data[2] else 0) 
-    # NEW: Read Order Type string (default to Market if empty)
-    f2_type = data[3][0][0].upper() if (len(data) > 3 and data[3]) else "MARKET"
-    
-    return d2, e2, h4, f2_type
-
 def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
+    """Updates Memory AND Sheet after a trade"""
     global BOT_MEMORY
     
     old_h4 = BOT_MEMORY['h4_cost']
@@ -134,19 +116,17 @@ def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
     
     return new_d2
 
-# --- BACKGROUND TASKS (H1/H2 Monitor) ---
+# --- BACKGROUND TASKS ---
 def background_sync_loop():
     global BOT_MEMORY
     tick = 0 
     while True:
+        # CRASH FIX: Try/Except covers the WHOLE loop iteration
         try:
             sheet = get_sheet()
             
-            # --- TASK A: Sync Settings ---
+            # --- TASK A: Sync Settings (Every 15s) ---
             data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
-            
-            # SAFE UNPACKING (Prevents IndexErrors on empty cells)
-            # data[0] is the result for D2. If cell is empty, it might be []
             
             val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
             val_e2 = data[1][0][0] if (len(data) > 1 and data[1]) else 100
@@ -159,7 +139,7 @@ def background_sync_loop():
             BOT_MEMORY['f2_type'] = str(val_f2).upper()
 
             # --- TASK B: Update Dashboard (Every 60s) ---
-            if tick % 6 == 0:
+            if tick % 4 == 0: 
                 usdt = get_balance("USDT")
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sheet.update('A2:B2', [[ts, usdt]])
@@ -172,15 +152,22 @@ def background_sync_loop():
                     sheet.update('H2', [[c_bal]])
 
         except Exception as e:
-            print(f"Sync Loop Error: {e}")
+            print(f"Sync Loop Error (Retrying in 15s): {e}")
+            # Optional: Force reconnect logic could go here
         
         tick += 1
-        time.sleep(5) # 10 seconds interval
+        time.sleep(15) 
 
 t = threading.Thread(target=background_sync_loop, daemon=True)
 t.start()
 
-# --- WEBHOOK ---
+# --- ROUTES ---
+
+@app.route('/')
+def home():
+    """Fix for UptimeRobot 404s"""
+    return "Bot is awake.", 200
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(force=True)
@@ -199,7 +186,7 @@ def webhook():
     final_cap = 0
     
     try:
-        # 1. READ FROM MEMORY (0ms Latency)
+        # 1. READ FROM MEMORY
         d2_cap = BOT_MEMORY['d2_cap']
         e2_pct = BOT_MEMORY['e2_pct']
         f2_type = BOT_MEMORY['f2_type']
@@ -210,10 +197,9 @@ def webhook():
         payload_type = data.get('type', 'MARKET').upper()
         target_type = payload_type
         
-        # LOGIC FIX: Ignore Sheet F2 if this is a Manual CLI command
         is_manual_cli = "CLI" in reason
         
-        # Only check Sheet override if NOT CLI
+        # Override Market with Limit if Sheet says so (and not CLI)
         if not is_manual_cli and payload_type == 'MARKET' and 'LIMIT' in f2_type:
             if sent_price != 'Market' and safe_float(sent_price) > 0:
                 target_type = 'LIMIT'
@@ -229,10 +215,8 @@ def webhook():
             params = {"symbol": symbol, "side": "BUY", "type": target_type}
             
             if target_type == 'LIMIT':
-                # Use limit_price from payload OR sent_price from chart/F2 override
                 price_val = float(data.get('limit_price', sent_price))
-                
-                qty_coins = amt / price_val
+                qty_coins = amt / price_val 
                 step = get_symbol_step_size(symbol)
                 qty_coins = round_step_size(qty_coins, step)
                 
@@ -277,13 +261,11 @@ def webhook():
         # --- LOGGING & COMPOUNDING ---
         sheet = get_sheet()
         
-        # Calculate USDT Value of trade for compounding
         if 'cummulativeQuoteQty' in resp:
             usdt_value = float(resp['cummulativeQuoteQty'])
         elif 'origQty' in resp and 'price' in resp:
             usdt_value = float(resp['origQty']) * float(resp['price'])
 
-        # Get Execution details
         if 'fills' in resp and len(resp['fills']) > 0:
             exec_price = resp['fills'][0]['price']
             exec_qty = resp['fills'][0]['qty']
@@ -291,31 +273,24 @@ def webhook():
             exec_price = data.get('limit_price', 'Market/Pending')
             exec_qty = resp.get('origQty', 0)
 
-        # Update D2/H4 (Compounding)
         if status.startswith("Filled"):
             final_cap = update_compounding_after_trade(sheet, side, usdt_value, float(exec_qty), symbol)
 
-        # Log Row
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         applied_pct = f"{req_pct}%" if side == 'BUY' else "100%"
         
-        # Columns: Time, Symbol, Side, Req%, SentPrice, ExecPrice, ExecQty, Status, Reason, New Cap
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, final_cap]
         sheet.append_row(row)
         
-        # --- Force Immediate H2 Update if Symbol matches H1 ---
+        # Force H2 Update
         try:
             h1_val = sheet.acell('H1').value
             if h1_val:
                 monitor_symbol = h1_val.replace("USDT","").strip().upper()
-                # Check if the traded symbol is the one we are monitoring
                 if monitor_symbol in symbol: 
-                    # Fetch fresh balance immediately
                     new_coin_bal = get_balance(monitor_symbol)
                     sheet.update('H2', [[new_coin_bal]])
         except: pass
-        # -----------------------------------------------------------
-
         
         return jsonify(resp)
 
@@ -326,7 +301,6 @@ def webhook():
 
 @app.route('/cli', methods=['POST'])
 def cli():
-    # Pass-through for simple CLI status checks
     data = request.json
     if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
@@ -334,31 +308,27 @@ def cli():
     params = data.get('params', {})
     
     if method == "get_capital_status":
-        # Check if Memory is "Stale" (Default values)
-        if BOT_MEMORY['d2_cap'] == 0.0 and BOT_MEMORY['e2_pct'] == 100.0:
-            # FORCE REFRESH to verify connection
-            try:
-                sheet = get_sheet()
-                data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
-                
-                # Update Memory
-                # Safety check: Ensure list is deep enough
-                d2_val = data[0][0][0] if (len(data) > 0 and len(data[0]) > 0 and len(data[0][0]) > 0) else 0
-                e2_val = data[1][0][0] if (len(data) > 1 and len(data[1]) > 0 and len(data[1][0]) > 0) else 100
-                
-                BOT_MEMORY['d2_cap'] = safe_float(d2_val)
-                BOT_MEMORY['e2_pct'] = safe_float(e2_val)
-                # (We don't need to update H4/F2 here for status check)
-                
-            except Exception as e:
-                # This will print the ACTUAL error to your terminal
-                return jsonify({"error": f"Sheet Sync Failed: {str(e)}"}), 500
-
-        # Read from Memory
-        d2 = BOT_MEMORY['d2_cap']
-        e2 = BOT_MEMORY['e2_pct']
-        bal = get_balance("USDT")
-        return jsonify({"dedicated_cap": d2, "reinvest_pct": e2, "wallet_balance": bal, "effective_cap": min(d2, bal)})
+        # FORCE REFRESH: Read sheet directly to bypass stale memory
+        try:
+            sheet = get_sheet()
+            data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
+            
+            d2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 0)
+            e2 = safe_float(data[1][0][0] if (len(data)>1 and data[1]) else 100)
+            
+            # Update Memory with fresh data
+            BOT_MEMORY['d2_cap'] = d2
+            BOT_MEMORY['e2_pct'] = e2
+            
+            bal = get_balance("USDT")
+            return jsonify({
+                "dedicated_cap": d2, 
+                "reinvest_pct": e2, 
+                "wallet_balance": bal, 
+                "effective_cap": min(d2, bal)
+            })
+        except Exception as e:
+             return jsonify({"error": f"Sheet Sync Failed: {str(e)}"}), 500
     
     if hasattr(client, method):
         return jsonify(getattr(client, method)(**params))
