@@ -280,7 +280,9 @@ def webhook():
         applied_pct = f"{req_pct}%" if side == 'BUY' else "100%"
         
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, final_cap]
-        sheet.append_row(row)
+        # Force gspread to append relative to the table starting at A5
+        # This prevents it from writing to column R
+        sheet.append_row(row, table_range='A5')
         
         # Force H2 Update
         try:
