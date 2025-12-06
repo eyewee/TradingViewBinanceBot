@@ -141,8 +141,13 @@ def background_sync_loop():
             # --- TASK B: Update Dashboard (Every 60s) ---
             if tick % 4 == 0: 
                 usdt = get_balance("USDT")
+                # 1. Fetch BTC Price again
+                btc = get_coin_price("BTCUSDT")
+                
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.update('A2:B2', [[ts, usdt]])
+                
+                # 2. Update Range A2:C2 (Time, USDT, BTC Price)
+                sheet.update('A2:C2', [[ts, usdt, btc]])
                 
                 # Monitor H1 Coin
                 h1_val = sheet.acell('H1').value
