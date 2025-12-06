@@ -65,6 +65,11 @@ def get_balance(asset):
     except: pass
     return 0.0
 
+def get_coin_price(symbol):
+    try:
+        return float(client.ticker_price(symbol=symbol)['price'])
+    except: return 0.0
+
 def get_symbol_step_size(symbol):
     try:
         info = client.exchange_info(symbol=symbol)
