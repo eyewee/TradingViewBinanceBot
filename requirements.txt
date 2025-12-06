@@ -3,4 +3,5 @@ binance-connector
 gunicorn
 gspread>=5.10.0
 google-auth
-urllib3==1.26.15
+requests
+urllib3
