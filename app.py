@@ -126,7 +126,7 @@ def background_sync_loop():
     global BOT_MEMORY
     
     # CRITICAL FIX: Wait 10s for Server to boot before hitting Google
-    time.sleep(10)
+    time.sleep(1)
     
     tick = 0 
     while True:
@@ -200,6 +200,26 @@ def webhook():
         e2_pct = BOT_MEMORY['e2_pct']
         f2_type = BOT_MEMORY['f2_type']
         h4_cost = BOT_MEMORY['h4_cost']
+        
+        # --- SAFETY FALLBACK: If Memory is Empty/Zero, Force Read Sheet ---
+        if d2_cap == 0:
+            try:
+                print("Memory Empty (0.0). Forcing Sheet Read...")
+                sheet = get_sheet()
+                s_data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
+                d2_cap = safe_float(s_data[0][0][0] if (len(s_data)>0 and s_data[0]) else 0)
+                e2_pct = safe_float(s_data[1][0][0] if (len(s_data)>1 and s_data[1]) else 100)
+                h4_cost = safe_float(s_data[2][0][0] if (len(s_data)>2 and s_data[2]) else 0)
+                f2_type = str(s_data[3][0][0]).upper() if (len(s_data)>3 and s_data[3]) else "MARKET"
+                
+                # Update Memory for next time
+                BOT_MEMORY['d2_cap'] = d2_cap
+                BOT_MEMORY['e2_pct'] = e2_pct
+                BOT_MEMORY['h4_cost'] = h4_cost
+                BOT_MEMORY['f2_type'] = f2_type
+            except Exception as e:
+                print(f"Fallback Read Failed: {e}")
+        # ------------------------------------------------------------------
         final_cap = d2_cap
         
         # 2. Determine Order Type
@@ -312,7 +332,9 @@ def webhook():
         return jsonify(resp)
 
     except Exception as e:
-        try: get_sheet().append_row([datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "ERROR", 0, 0, 0, 0, str(e)])
+        try: 
+            # Added table_range='A5' to prevent misalignment
+            get_sheet().append_row([datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "ERROR", 0, 0, 0, 0, str(e)], table_range='A5')
         except: pass
         return jsonify({"error": str(e)}), 500
 
@@ -323,6 +345,10 @@ def cli():
     
     method = data.get('method')
     params = data.get('params', {})
+    
+    # NEW: Raw Memory Dump (No Sheet Refresh)
+    if method == "debug_memory":
+        return jsonify(BOT_MEMORY)
     
     if method == "get_capital_status":
         # FORCE REFRESH: Read sheet directly to bypass stale memory

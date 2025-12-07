@@ -236,6 +236,11 @@ if __name__ == "__main__":
         sym = args[2].upper()
         res = send_request("/cli", {"method": "ticker_price", "params": {"symbol": sym}})
         print(f"Price: {res['price']}")
+        
+    elif cmd == "memory":
+        print("Fetching Raw Server Memory...")
+        res = send_request("/cli", {"method": "debug_memory"})
+        print(json.dumps(res, indent=2))
 
     else:
         # MAP SHORTCUTS TO REAL BINANCE METHODS
