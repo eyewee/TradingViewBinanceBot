@@ -125,15 +125,14 @@ def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
 def background_sync_loop():
     global BOT_MEMORY
     
-    # CRITICAL FIX: Wait 10s for Server to boot before hitting Google
+    # Allow server boot
     time.sleep(1)
     
     tick = 0 
     while True:
+        # --- TASK A: CRITICAL MEMORY SYNC (D2, E2, H4, F2) ---
         try:
             sheet = get_sheet()
-            
-            # --- TASK A: Sync Settings ---
             data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
             
             val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
@@ -145,27 +144,39 @@ def background_sync_loop():
             BOT_MEMORY['e2_pct'] = safe_float(val_e2)
             BOT_MEMORY['h4_cost'] = safe_float(val_h4)
             BOT_MEMORY['f2_type'] = str(val_f2).upper()
+            
+            # Clear error flag if successful
+            BOT_MEMORY['last_error'] = None
 
-            # --- TASK B: Update Dashboard (Every 60s) ---
-            if tick % 4 == 0: 
+        except Exception as e:
+            # Save error to memory so you can see it via CLI
+            BOT_MEMORY['last_error'] = f"Sync Failed: {str(e)}"
+            print(f"Sync Failed: {e}")
+
+        # --- TASK B: VISUAL DASHBOARD UPDATE (Every 60s) ---
+        # We put this in its own try/except so it NEVER stops Task A
+        if tick % 4 == 0: 
+            try:
                 usdt = get_balance("USDT")
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.update('A2:B2', [[ts, usdt]])
+                # Safe BTC price fetch
+                try: btc = get_coin_price("BTCUSDT")
+                except: btc = 0
                 
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sheet.update('A2:C2', [[ts, usdt, btc]])
+                
+                # Monitor H1 Coin
                 h1_val = sheet.acell('H1').value
                 if h1_val:
                     mon_sym = h1_val.replace("USDT","").strip().upper()
                     c_bal = get_balance(mon_sym)
                     sheet.update('H2', [[c_bal]])
-            
-            # Normal Sleep 15s (prevents Rate Limits)
-            time.sleep(15)
-            tick += 1
+            except Exception as e:
+                print(f"Dashboard Update Failed: {e}")
 
-        except Exception as e:
-            print(f"Sync Loop Error: {e}")
-            # CRITICAL FIX: If Google fails, sleep 60s to prevent Crash Loop
-            time.sleep(60) 
+        # Standard Wait
+        tick += 1
+        time.sleep(15)
 
 t = threading.Thread(target=background_sync_loop, daemon=True)
 t.start()
