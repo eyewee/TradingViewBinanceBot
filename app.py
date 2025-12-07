@@ -124,13 +124,16 @@ def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
 # --- BACKGROUND TASKS ---
 def background_sync_loop():
     global BOT_MEMORY
+    
+    # CRITICAL FIX: Wait 10s for Server to boot before hitting Google
+    time.sleep(10)
+    
     tick = 0 
     while True:
-        # CRASH FIX: Try/Except covers the WHOLE loop iteration
         try:
             sheet = get_sheet()
             
-            # --- TASK A: Sync Settings (Every 15s) ---
+            # --- TASK A: Sync Settings ---
             data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
             
             val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
@@ -146,27 +149,23 @@ def background_sync_loop():
             # --- TASK B: Update Dashboard (Every 60s) ---
             if tick % 4 == 0: 
                 usdt = get_balance("USDT")
-                # 1. Fetch BTC Price again
-                btc = get_coin_price("BTCUSDT")
-                
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sheet.update('A2:B2', [[ts, usdt]])
                 
-                # 2. Update Range A2:C2 (Time, USDT, BTC Price)
-                sheet.update('A2:C2', [[ts, usdt, btc]])
-                
-                # Monitor H1 Coin
                 h1_val = sheet.acell('H1').value
                 if h1_val:
                     mon_sym = h1_val.replace("USDT","").strip().upper()
                     c_bal = get_balance(mon_sym)
                     sheet.update('H2', [[c_bal]])
+            
+            # Normal Sleep 15s (prevents Rate Limits)
+            time.sleep(15)
+            tick += 1
 
         except Exception as e:
-            print(f"Sync Loop Error (Retrying in 15s): {e}")
-            # Optional: Force reconnect logic could go here
-        
-        tick += 1
-        time.sleep(15) 
+            print(f"Sync Loop Error: {e}")
+            # CRITICAL FIX: If Google fails, sleep 60s to prevent Crash Loop
+            time.sleep(60) 
 
 t = threading.Thread(target=background_sync_loop, daemon=True)
 t.start()
@@ -241,8 +240,9 @@ def webhook():
                 resp = client.new_order(**params)
                 status = "Filled/Open"
             else:
-                status = "Skipped: Low Amt"
-                resp = {"status": "skipped", "msg": f"Amt {amt} < 10"}
+                # DETAILED LOGGING FIX
+                status = f"Skipped: Amt {amt:.2f} < 10 (Cap: {d2_cap}, Pct: {req_pct})"
+                resp = {"status": "skipped", "msg": status}
 
         elif side == 'SELL':
             base = symbol.replace("USDT","")
@@ -280,7 +280,12 @@ def webhook():
             exec_price = resp['fills'][0]['price']
             exec_qty = resp['fills'][0]['qty']
         else:
-            exec_price = data.get('limit_price', 'Market/Pending')
+            # FIX: If skipped, Price is 0. If Limit Pending, use Limit Price.
+            if status.startswith("Skipped"):
+                exec_price = 0
+            else:
+                exec_price = data.get('limit_price', sent_price)
+            
             exec_qty = resp.get('origQty', 0)
 
         if status.startswith("Filled"):
