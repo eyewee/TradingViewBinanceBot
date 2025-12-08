@@ -315,7 +315,9 @@ def webhook():
             if status.startswith("Skipped"):
                 exec_price = 0
             else:
-                exec_price = data.get('limit_price', sent_price)
+                # If Market order pending (rare), use 0 or sent_price
+                # If Limit order, use the limit price
+                exec_price = data.get('limit_price', sent_price if sent_price != 'Market' else 0)
             
             exec_qty = resp.get('origQty', 0)
 
@@ -325,10 +327,28 @@ def webhook():
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         applied_pct = f"{req_pct}%" if side == 'BUY' else "100%"
         
+        # Columns: Time, Symbol, Side, Req%, SentPrice, ExecPrice, ExecQty, Status, Reason, New Cap
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, final_cap]
-        # Force gspread to append relative to the table starting at A5
-        # This prevents it from writing to column R
-        sheet.append_row(row, table_range='A5')
+        
+        # PRECISE ROW CALCULATION
+        try:
+            # Get all data in Column A (Timestamps)
+            col_a_values = sheet.col_values(1)
+            
+            # Calculate next empty row
+            next_row = len(col_a_values) + 1
+            
+            # CRITICAL: Never write above row 6 (Preserves Dashboard A1:C2 and Headers A5)
+            if next_row < 6: 
+                next_row = 6
+            
+            # Write to specific range (e.g., A6:J6)
+            sheet.update(f'A{next_row}:J{next_row}', [row])
+            
+        except Exception as write_err:
+            print(f"Row Write Error: {write_err}")
+            # Last resort fallback
+            sheet.append_row(row)
         
         # Force H2 Update
         try:
