@@ -65,6 +65,18 @@ def get_balance(asset):
     except: pass
     return 0.0
 
+def cancel_all_open_orders(symbol):
+    try:
+        # Check if any open orders exist first to save API calls
+        open_orders = client.get_open_orders(symbol)
+        if open_orders:
+            client.cancel_open_orders(symbol)
+            print(f"Cancelled {len(open_orders)} open orders for {symbol}")
+            return True
+    except Exception as e:
+        print(f"Cancel Failed: {e}")
+    return False
+
 def get_coin_price(symbol):
     try:
         return float(client.ticker_price(symbol=symbol)['price'])
@@ -78,48 +90,83 @@ def get_symbol_step_size(symbol):
     except: pass
     return '0.00001'
 
+def get_price_tick_size(symbol):
+    try:
+        info = client.exchange_info(symbol=symbol)
+        for f in info['symbols'][0]['filters']:
+            if f['filterType'] == 'PRICE_FILTER': return f['tickSize']
+    except: pass
+    return '0.000001'
+
 def round_step_size(quantity, step_size):
     precision = int(round(-math.log(float(step_size), 10), 0))
     return float(round(quantity - (quantity % float(step_size)), precision))
 
 def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
-    """Updates Memory AND Sheet after a trade"""
     global BOT_MEMORY
     
-    old_h4 = BOT_MEMORY['h4_cost']
-    old_d2 = BOT_MEMORY['d2_cap']
+    # Current State
+    current_cost = BOT_MEMORY['h4_cost']
+    current_cap = BOT_MEMORY['d2_cap']
     
-    new_d2 = old_d2
-    new_h4 = old_h4
+    new_d2 = current_cap
+    new_h4 = current_cost
 
     if side == "BUY":
-        new_h4 = old_h4 + usdt_value
+        # LOGIC: Buying increases our Cost Basis (Money locked in trade)
+        # We ADD to H4 in case we do multiple buys (DCA)
+        new_h4 = current_cost + usdt_value
+        # D2 (Capital) does NOT change on buy. It waits for the Sell to realize PnL.
     
     elif side == "SELL":
+        # LOGIC: Selling realizes Profit/Loss
+        # 1. Calculate how much of the "bag" we sold (Ratio)
         base = symbol.replace("USDT", "")
         rem_bal = get_balance(base)
-        total_held = rem_bal + coin_qty 
+        total_held = rem_bal + coin_qty # Total we had before this sell
         
         if total_held > 0:
-            ratio = coin_qty / total_held 
-            cost_sold = old_h4 * ratio
-            pnl = usdt_value - cost_sold
-            new_d2 = old_d2 + pnl
-            new_h4 = old_h4 - cost_sold
-            if rem_bal < (coin_qty * 0.01): new_h4 = 0
+            ratio_sold = coin_qty / total_held
+            cost_of_sold_portion = current_cost * ratio_sold
+            
+            # 2. Profit = Revenue - Cost
+            profit = usdt_value - cost_of_sold_portion
+            
+            # 3. Update Capital (Compounding)
+            new_d2 = current_cap + profit
+            
+            # 4. Reduce Cost Basis
+            new_h4 = current_cost - cost_of_sold_portion
+            
+            # Cleanup: If we sold everything (dust check), reset H4 to 0
+            if rem_bal < (coin_qty * 0.02): 
+                new_h4 = 0
 
-    # Update Memory Immediately
+    # UPDATE MEMORY (Master)
     BOT_MEMORY['d2_cap'] = new_d2
     BOT_MEMORY['h4_cost'] = new_h4
     
-    # Update Sheet
+    # UPDATE SHEET (Backup/Display)
     try:
+        # Update D2 (Capital), H3 (Mirror of Cap for you), H4 (Cost)
         sheet.update('D2', [[new_d2]])
         sheet.update('H3', [[new_d2]]) 
         sheet.update('H4', [[new_h4]])
     except: pass
     
     return new_d2
+
+def init_memory_state():
+    """Loads H4 (Cost Basis) only ONCE at startup to recover state"""
+    global BOT_MEMORY
+    try:
+        sheet = get_sheet()
+        # Read H4 specifically
+        h4_val = sheet.acell('H4').value
+        BOT_MEMORY['h4_cost'] = safe_float(h4_val)
+        print(f"State Recovered: Cost Basis = {BOT_MEMORY['h4_cost']}")
+    except Exception as e:
+        print(f"Init State Failed: {e}")
 
 # --- BACKGROUND TASKS ---
 def background_sync_loop():
@@ -128,22 +175,24 @@ def background_sync_loop():
     # Allow server boot
     time.sleep(1)
     
+    # NEW: Recover state once on boot
+    init_memory_state()
+    
     tick = 0 
     while True:
-        # --- TASK A: CRITICAL MEMORY SYNC (D2, E2, H4, F2) ---
         try:
-            sheet = get_sheet()
-            data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
+            # --- TASK A: Sync Settings (D2, E2, F2 ONLY) ---
+            # We DO NOT sync H4 here. H4 is managed strictly by the Webhook.
+            data = sheet.batch_get(['D2', 'E2', 'F2'])
             
             val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
             val_e2 = data[1][0][0] if (len(data) > 1 and data[1]) else 100
-            val_h4 = data[2][0][0] if (len(data) > 2 and data[2]) else 0
-            val_f2 = data[3][0][0] if (len(data) > 3 and data[3]) else "MARKET"
+            val_f2 = data[2][0][0] if (len(data) > 2 and data[2]) else "MARKET"
 
             BOT_MEMORY['d2_cap'] = safe_float(val_d2)
             BOT_MEMORY['e2_pct'] = safe_float(val_e2)
-            BOT_MEMORY['h4_cost'] = safe_float(val_h4)
             BOT_MEMORY['f2_type'] = str(val_f2).upper()
+            # Note: H4 is intentionally skipped to prevent race conditions
             
             # Clear error flag if successful
             BOT_MEMORY['last_error'] = None
@@ -188,6 +237,16 @@ def home():
     """Fix for UptimeRobot 404s"""
     return "Bot is awake.", 200
 
+def write_log_row(sheet, row_data):
+    try:
+        col_a = sheet.col_values(1)
+        next_row = len(col_a) + 1
+        if next_row < 6: next_row = 6
+        sheet.update(f'A{next_row}:J{next_row}', [row_data])
+    except Exception as e:
+        print(f"Write Failed: {e}")
+        sheet.append_row(row_data)
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.get_json(force=True)
@@ -211,6 +270,14 @@ def webhook():
         e2_pct = BOT_MEMORY['e2_pct']
         f2_type = BOT_MEMORY['f2_type']
         h4_cost = BOT_MEMORY['h4_cost']
+        
+        # --- NEW: ONE ORDER RULE ---
+        # Cancel any pending orders before processing the new signal
+        was_cancelled = cancel_all_open_orders(symbol)
+        if was_cancelled:
+            # Log the cancellation? Optional, but good for tracking.
+            # We proceed with the new signal logic below.
+            pass
         
         # --- SAFETY FALLBACK: If Memory is Empty/Zero, Force Read Sheet ---
         if d2_cap == 0:
@@ -255,15 +322,21 @@ def webhook():
             params = {"symbol": symbol, "side": "BUY", "type": target_type}
             
             if target_type == 'LIMIT':
-                price_val = float(data.get('limit_price', sent_price))
-                qty_coins = amt / price_val 
+                raw_price = float(data.get('limit_price', sent_price))
+                tick_size = get_price_tick_size(symbol)
+                
+                # CRITICAL: If raw_price has MORE decimals than tick_size, round it.
+                # If it has LESS or EQUAL, keep it exact.
+                final_limit_price = round_step_size(raw_price, tick_size)
+                
+                qty_coins = amt / final_limit_price 
                 step = get_symbol_step_size(symbol)
                 qty_coins = round_step_size(qty_coins, step)
                 
                 params['timeInForce'] = data.get('timeInForce', 'GTC')
                 params['quantity'] = qty_coins
-                params['price'] = str(price_val)
-                amt = qty_coins * price_val 
+                params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
+                amt = qty_coins * final_limit_price
             else:
                 params['quoteOrderQty'] = round(amt, 2)
 
@@ -289,9 +362,12 @@ def webhook():
                 params = {"symbol": symbol, "side": "SELL", "type": target_type}
 
                 if target_type == 'LIMIT':
-                    price_val = float(data.get('limit_price', sent_price))
+                    raw_price = float(data.get('limit_price', sent_price))
+                    tick_size = get_price_tick_size(symbol)
+                    final_limit_price = round_step_size(raw_price, tick_size)
+
                     params['quantity'] = qty
-                    params['price'] = str(price_val)
+                    params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
                     params['timeInForce'] = data.get('timeInForce', 'GTC')
                 else:
                     params['quantity'] = qty
@@ -343,12 +419,7 @@ def webhook():
                 next_row = 6
             
             # Write to specific range (e.g., A6:J6)
-            sheet.update(f'A{next_row}:J{next_row}', [row])
-            
-        except Exception as write_err:
-            print(f"Row Write Error: {write_err}")
-            # Last resort fallback
-            sheet.append_row(row)
+            write_log_row(sheet, row)
         
         # Force H2 Update
         try:
@@ -365,7 +436,10 @@ def webhook():
     except Exception as e:
         try: 
             # Added table_range='A5' to prevent misalignment
-            get_sheet().append_row([datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "ERROR", 0, 0, 0, 0, str(e)], table_range='A5')
+            if sheet:
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Pad with 0s to ensure 10 columns for alignment
+                write_log_row(sheet, [ts, symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0])
         except: pass
         return jsonify({"error": str(e)}), 500
 
