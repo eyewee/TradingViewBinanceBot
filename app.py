@@ -30,7 +30,6 @@ GOOGLE_CLIENT = None
 BOT_MEMORY = {
     "d2_cap": 0.0,
     "e2_pct": 100.0,
-    "h4_cost": 0.0,
     "f2_type": "MARKET"
 }
 
@@ -38,6 +37,49 @@ BOT_MEMORY = {
 LOG_QUEUE = []
 
 # --- HELPERS ---
+def get_cost_basis_from_history(symbol, qty_held):
+    """
+    Reconstructs the USDT cost of the coins you currently hold 
+    by looking at recent BUY trades on Binance.
+    """
+    if qty_held <= 0: return 0.0
+    
+    try:
+        # Fetch last 20 trades (should be enough for alternating strategy)
+        trades = client.my_trades(symbol=symbol, limit=20)
+        # Reverse to look at newest first
+        trades.reverse()
+        
+        cost_accumulated = 0.0
+        qty_needed = qty_held
+        
+        for t in trades:
+            if t['isBuyer']: # It was a BUY
+                trade_qty = float(t['qty'])
+                trade_quote = float(t['quoteQty']) # Total USDT spent
+                
+                if qty_needed <= 0:
+                    break
+                
+                # If this trade covers what we have left
+                if trade_qty >= qty_needed:
+                    # Pro-rate the cost (e.g. bought 100, holding 50 -> take 50% cost)
+                    fraction = qty_needed / trade_qty
+                    cost_accumulated += (trade_quote * fraction)
+                    qty_needed = 0
+                else:
+                    # We are holding this entire buy order
+                    cost_accumulated += trade_quote
+                    qty_needed -= trade_qty
+        
+        return cost_accumulated
+        
+    except Exception as e:
+        print(f"Cost Basis Error: {e}")
+        # Fallback: Estimate using current balance * avg price? 
+        # Safer to return 0 to avoid breaking math, but profit will look huge.
+        return 0.0
+
 def safe_float(value, default=0.0):
     try:
         if isinstance(value, str):
@@ -107,46 +149,46 @@ def round_step_size(quantity, step_size):
 def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
     global BOT_MEMORY
     
-    old_h4 = BOT_MEMORY['h4_cost']
-    old_d2 = BOT_MEMORY['d2_cap']
-    
-    new_d2 = old_d2
-    new_h4 = old_h4
+    current_cap = BOT_MEMORY['d2_cap']
+    new_d2 = current_cap
 
     if side == "BUY":
-        new_h4 = old_h4 + usdt_value
+        # Buying does not change Capital (Unrealized PnL).
+        # We don't need to track cost in memory anymore.
+        pass
     
     elif side == "SELL":
-        base = symbol.replace("USDT", "")
-        rem_bal = get_balance(base)
-        total_held = rem_bal + coin_qty 
+        # 1. GROUND TRUTH: How much did these specific coins cost us?
+        cost_basis = get_cost_basis_from_history(symbol, coin_qty)
         
-        if total_held > 0:
-            ratio = coin_qty / total_held 
-            cost_sold = old_h4 * ratio
-            pnl = usdt_value - cost_sold
-            new_d2 = old_d2 + pnl
-            new_h4 = old_h4 - cost_sold
-            if rem_bal < (coin_qty * 0.02): new_h4 = 0
+        # 2. Profit = Sold Value - Historical Cost
+        profit = usdt_value - cost_basis
+        
+        # 3. Update Capital
+        new_d2 = current_cap + profit
+        print(f"Sold for {usdt_value}, Cost was {cost_basis}, PnL: {profit}. New Cap: {new_d2}")
 
-    # 1. Update RAM (Instant for next trade)
+    # Update Memory (Only D2 matters now)
     BOT_MEMORY['d2_cap'] = new_d2
-    BOT_MEMORY['h4_cost'] = new_h4
     
-    # 2. Queue Sheet Update (Guaranteed Persistence)
-    LOG_QUEUE.append(('STATE', [new_d2, new_h4]))
+    # Update Sheet
+    # We retry 3 times to ensure money data is saved
+    for attempt in range(3):
+        try:
+            # We only update D2 and H3. H4 is dead.
+            sheet.batch_update([
+                {'range': 'D2', 'values': [[new_d2]]},
+                {'range': 'H3', 'values': [[new_d2]]}
+            ])
+            break
+        except Exception as e:
+            time.sleep(1)
     
     return new_d2
 
 def init_memory_state():
-    global BOT_MEMORY
-    try:
-        sheet = get_sheet()
-        h4_val = sheet.acell('H4').value
-        BOT_MEMORY['h4_cost'] = safe_float(h4_val)
-        print(f"State Recovered: Cost Basis = {BOT_MEMORY['h4_cost']}")
-    except Exception as e:
-        print(f"Init State Failed: {e}")
+    """No longer needs to recover Cost Basis (Stateless)"""
+    pass
 
 def logger_worker():
     """Handles Log Rows AND State Updates to ensure data consistency"""
@@ -215,8 +257,6 @@ def background_sync_loop():
             BOT_MEMORY['d2_cap'] = safe_float(val_d2)
             BOT_MEMORY['e2_pct'] = safe_float(val_e2)
             BOT_MEMORY['f2_type'] = str(val_f2).upper()
-            
-            BOT_MEMORY['last_error'] = None
 
             # --- TASK B: Update Dashboard (Every 60s) ---
             if tick % 4 == 0: 
