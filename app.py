@@ -36,50 +36,13 @@ BOT_MEMORY = {
 # --- LOGGING QUEUE ---
 LOG_QUEUE = []
 
-# --- HELPERS ---
-def get_cost_basis_from_history(symbol, qty_held):
-    """
-    Reconstructs the USDT cost of the coins you currently hold 
-    by looking at recent BUY trades on Binance.
-    """
-    if qty_held <= 0: return 0.0
-    
-    try:
-        # Fetch last 20 trades (should be enough for alternating strategy)
-        trades = client.my_trades(symbol=symbol, limit=20)
-        # Reverse to look at newest first
-        trades.reverse()
-        
-        cost_accumulated = 0.0
-        qty_needed = qty_held
-        
-        for t in trades:
-            if t['isBuyer']: # It was a BUY
-                trade_qty = float(t['qty'])
-                trade_quote = float(t['quoteQty']) # Total USDT spent
-                
-                if qty_needed <= 0:
-                    break
-                
-                # If this trade covers what we have left
-                if trade_qty >= qty_needed:
-                    # Pro-rate the cost (e.g. bought 100, holding 50 -> take 50% cost)
-                    fraction = qty_needed / trade_qty
-                    cost_accumulated += (trade_quote * fraction)
-                    qty_needed = 0
-                else:
-                    # We are holding this entire buy order
-                    cost_accumulated += trade_quote
-                    qty_needed -= trade_qty
-        
-        return cost_accumulated
-        
-    except Exception as e:
-        print(f"Cost Basis Error: {e}")
-        # Fallback: Estimate using current balance * avg price? 
-        # Safer to return 0 to avoid breaking math, but profit will look huge.
-        return 0.0
+# --- THREAD CONTROL ---
+THREADS = {
+    "logger": None,
+    "sync": None
+}
 
+# --- HELPERS ---
 def safe_float(value, default=0.0):
     try:
         if isinstance(value, str):
@@ -115,10 +78,8 @@ def cancel_all_open_orders(symbol):
         open_orders = client.get_open_orders(symbol)
         if open_orders:
             client.cancel_open_orders(symbol)
-            print(f"Cancelled {len(open_orders)} open orders for {symbol}")
             return True
-    except Exception as e:
-        print(f"Cancel Failed: {e}")
+    except: pass
     return False
 
 def get_coin_price(symbol):
@@ -146,110 +107,88 @@ def round_step_size(quantity, step_size):
     precision = int(round(-math.log(float(step_size), 10), 0))
     return float(round(quantity - (quantity % float(step_size)), precision))
 
+def get_cost_basis_from_history(symbol, qty_held):
+    if qty_held <= 0: return 0.0
+    try:
+        trades = client.my_trades(symbol=symbol, limit=20)
+        trades.reverse()
+        cost_accumulated = 0.0
+        qty_needed = qty_held
+        for t in trades:
+            if t['isBuyer']:
+                trade_qty = float(t['qty'])
+                trade_quote = float(t['quoteQty'])
+                if qty_needed <= 0: break
+                if trade_qty >= qty_needed:
+                    fraction = qty_needed / trade_qty
+                    cost_accumulated += (trade_quote * fraction)
+                    qty_needed = 0
+                else:
+                    cost_accumulated += trade_quote
+                    qty_needed -= trade_qty
+        return cost_accumulated
+    except: return 0.0
+
 def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
     global BOT_MEMORY
     
     current_cap = BOT_MEMORY['d2_cap']
     new_d2 = current_cap
 
-    if side == "BUY":
-        # Buying does not change Capital (Unrealized PnL).
-        # We don't need to track cost in memory anymore.
-        pass
-    
-    elif side == "SELL":
-        # 1. GROUND TRUTH: How much did these specific coins cost us?
+    if side == "SELL":
         cost_basis = get_cost_basis_from_history(symbol, coin_qty)
-        
-        # 2. Profit = Sold Value - Historical Cost
         profit = usdt_value - cost_basis
-        
-        # 3. Update Capital
         new_d2 = current_cap + profit
-        print(f"Sold for {usdt_value}, Cost was {cost_basis}, PnL: {profit}. New Cap: {new_d2}")
 
-    # Update Memory (Only D2 matters now)
     BOT_MEMORY['d2_cap'] = new_d2
     
-    # Update Sheet
-    # We retry 3 times to ensure money data is saved
+    # CRITICAL DATA: Sync Save (Retries 3 times)
     for attempt in range(3):
         try:
-            # We only update D2 and H3. H4 is dead.
             sheet.batch_update([
                 {'range': 'D2', 'values': [[new_d2]]},
                 {'range': 'H3', 'values': [[new_d2]]}
             ])
             break
-        except Exception as e:
+        except Exception:
             time.sleep(1)
     
     return new_d2
 
-def init_memory_state():
-    """No longer needs to recover Cost Basis (Stateless)"""
-    pass
-
-def logger_worker():
-    """Handles Log Rows AND State Updates to ensure data consistency"""
+# --- WORKER FUNCTIONS ---
+def logger_worker_func():
+    """Consumes the LOG_QUEUE and writes to Google Sheets"""
     global LOG_QUEUE
     print("Logger Thread Started")
-    
     while True:
         if len(LOG_QUEUE) > 0:
-            task_type, data = LOG_QUEUE[0] # Peek
-            
+            task_type, data = LOG_QUEUE[0]
             try:
                 sheet = get_sheet()
-                
-                # --- TASK TYPE 1: LOG ROW ---
                 if task_type == 'LOG':
                     col_a = sheet.col_values(1)
                     next_row = len(col_a) + 1
                     if next_row < 6: next_row = 6
                     sheet.update(f'A{next_row}:J{next_row}', [data])
-                    print(f"Log Saved. Queue: {len(LOG_QUEUE)-1}")
-
-                # --- TASK TYPE 2: STATE UPDATE (D2, H4) ---
-                elif task_type == 'STATE':
-                    new_d2, new_h4 = data
-                    # Batch update for atomicity
-                    sheet.batch_update([
-                        {'range': 'D2', 'values': [[new_d2]]},
-                        {'range': 'H3', 'values': [[new_d2]]},
-                        {'range': 'H4', 'values': [[new_h4]]}
-                    ])
-                    print(f"State Saved (Cap: {new_d2}). Queue: {len(LOG_QUEUE)-1}")
-
-                # Success: Remove from queue
+                    print(f"Log persisted. Queue size: {len(LOG_QUEUE)-1}")
                 LOG_QUEUE.pop(0)
-                
             except Exception as e:
-                print(f"Logger Error ({task_type}): {e}")
-                time.sleep(5) # Wait before retry
-        
-        time.sleep(1) # CPU Saver
+                print(f"Logger Retrying: {e}")
+                time.sleep(5)
+        time.sleep(1)
 
-# Start the Logger Thread
-t_log = threading.Thread(target=logger_worker, daemon=True)
-t_log.start()
-
-# --- BACKGROUND TASKS ---
-def background_sync_loop():
+def background_sync_func():
+    """Syncs settings from Sheet to Memory every 15s"""
     global BOT_MEMORY
-    
-    # Wait for server boot
-    time.sleep(1)
-    init_memory_state()
-    
+    time.sleep(2) 
     tick = 0 
     while True:
         try:
             sheet = get_sheet()
-            
-            # --- TASK A: Sync Settings ---
+            # Task A: Sync Settings
             data = sheet.batch_get(['D2', 'E2', 'F2'])
             
+            # Safe unpack
             val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
             val_e2 = data[1][0][0] if (len(data) > 1 and data[1]) else 100
             val_f2 = data[2][0][0] if (len(data) > 2 and data[2]) else "MARKET"
@@ -258,14 +197,11 @@ def background_sync_loop():
             BOT_MEMORY['e2_pct'] = safe_float(val_e2)
             BOT_MEMORY['f2_type'] = str(val_f2).upper()
 
-            # --- TASK B: Update Dashboard (Every 60s) ---
+            # Task B: Dashboard
             if tick % 4 == 0: 
                 try:
                     usdt = get_balance("USDT")
-                    btc = 0
-                    try: btc = get_coin_price("BTCUSDT")
-                    except: pass
-                    
+                    btc = get_coin_price("BTCUSDT")
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     sheet.update('A2:C2', [[ts, usdt, btc]])
                     
@@ -274,27 +210,43 @@ def background_sync_loop():
                         mon_sym = h1_val.replace("USDT","").strip().upper()
                         c_bal = get_balance(mon_sym)
                         sheet.update('H2', [[c_bal]])
-                except Exception as dash_err:
-                    print(f"Dash Err: {dash_err}")
-
+                except: pass
         except Exception as e:
-            BOT_MEMORY['last_error'] = f"Sync Loop: {str(e)}"
+            print(f"Sync Error: {e}")
             time.sleep(60)
         
         tick += 1
         time.sleep(15)
 
-t = threading.Thread(target=background_sync_loop, daemon=True)
-t.start()
+# --- THREAD MANAGER (Gunicorn Fix) ---
+def ensure_threads_running():
+    global THREADS
+    
+    # Check Logger
+    if THREADS["logger"] is None or not THREADS["logger"].is_alive():
+        print("Starting Logger Thread...")
+        THREADS["logger"] = threading.Thread(target=logger_worker_func, daemon=True)
+        THREADS["logger"].start()
+        
+    # Check Sync
+    if THREADS["sync"] is None or not THREADS["sync"].is_alive():
+        print("Starting Sync Thread...")
+        THREADS["sync"] = threading.Thread(target=background_sync_func, daemon=True)
+        THREADS["sync"].start()
+
+# Check on load
+ensure_threads_running()
 
 # --- ROUTES ---
-
 @app.route('/')
 def home():
+    ensure_threads_running() 
     return "Bot is awake.", 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    ensure_threads_running()
+    
     data = request.get_json(force=True)
     if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
@@ -310,55 +262,43 @@ def webhook():
     usdt_value = 0
     final_cap = 0
     
-    # Init sheet for error logging fallback
+    # Init sheet for fallback logic
     try: sheet = get_sheet()
     except: sheet = None
 
     try:
-        # 1. READ FROM MEMORY
         d2_cap = BOT_MEMORY['d2_cap']
         e2_pct = BOT_MEMORY['e2_pct']
         f2_type = BOT_MEMORY['f2_type']
-        h4_cost = BOT_MEMORY['h4_cost']
         
-        # ONE ORDER RULE: Cancel pending before new signal
         cancel_all_open_orders(symbol)
         
-        # SAFETY FALLBACK: If Memory is Empty/Zero, Force Read Sheet
+        # Fallback if memory 0
         if d2_cap == 0:
             try:
-                print("Memory 0. Forcing Sheet Read...")
                 if sheet:
-                    s_data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
+                    s_data = sheet.batch_get(['D2', 'E2', 'F2'])
                     d2_cap = safe_float(s_data[0][0][0] if (len(s_data)>0 and s_data[0]) else 0)
                     e2_pct = safe_float(s_data[1][0][0] if (len(s_data)>1 and s_data[1]) else 100)
-                    h4_cost = safe_float(s_data[2][0][0] if (len(s_data)>2 and s_data[2]) else 0)
-                    f2_type = str(s_data[3][0][0]).upper() if (len(s_data)>3 and s_data[3]) else "MARKET"
-                    
+                    f2_type = str(s_data[2][0][0]).upper() if (len(s_data)>2 and s_data[2]) else "MARKET"
                     BOT_MEMORY['d2_cap'] = d2_cap
                     BOT_MEMORY['e2_pct'] = e2_pct
-                    BOT_MEMORY['h4_cost'] = h4_cost
                     BOT_MEMORY['f2_type'] = f2_type
-            except Exception as e:
-                print(f"Fallback Read Failed: {e}")
+            except: pass
         
         final_cap = d2_cap
         
-        # 2. Determine Order Type
         payload_type = data.get('type', 'MARKET').upper()
         target_type = payload_type
-        
         is_manual_cli = "CLI" in reason
         
         if not is_manual_cli and payload_type == 'MARKET' and 'LIMIT' in f2_type:
             if sent_price != 'Market' and safe_float(sent_price) > 0:
                 target_type = 'LIMIT'
 
-        # 3. Determine Trade Size & Execute
         if side == 'BUY':
             bal = get_balance("USDT")
             eff_cap = min(d2_cap, bal)
-            
             req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
             amt = eff_cap * (req_pct / 100.0)
             
@@ -375,7 +315,6 @@ def webhook():
                 
                 params['timeInForce'] = data.get('timeInForce', 'GTC')
                 params['quantity'] = qty_coins
-                # Format to remove scientific notation
                 params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
                 amt = qty_coins * final_limit_price 
             else:
@@ -405,7 +344,6 @@ def webhook():
                     raw_price = float(data.get('limit_price', sent_price))
                     tick_size = get_price_tick_size(symbol)
                     final_limit_price = round_step_size(raw_price, tick_size)
-
                     params['quantity'] = qty
                     params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
                     params['timeInForce'] = data.get('timeInForce', 'GTC')
@@ -415,7 +353,6 @@ def webhook():
                 resp = client.new_order(**params)  
                 status = "Filled"
 
-        # --- LOGGING & COMPOUNDING ---
         if 'cummulativeQuoteQty' in resp:
             usdt_value = float(resp['cummulativeQuoteQty'])
         elif 'origQty' in resp and 'price' in resp:
@@ -432,7 +369,6 @@ def webhook():
                     exec_price = float(params['price'])
                 else:
                     exec_price = safe_float(sent_price) if sent_price != 'Market' else 0
-            
             exec_qty = float(resp.get('origQty', 0))
 
         if status.startswith("Filled"):
@@ -443,32 +379,29 @@ def webhook():
         
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, final_cap]
         
-        # Queue Log Row
+        # QUEUE LOG (Instant Return)
         LOG_QUEUE.append(('LOG', row))
         
-        # Force H2 Update
+        # H2 Update (Instant if possible)
         try:
             h1_val = sheet.acell('H1').value
-            if h1_val:
-                mon_sym = h1_val.replace("USDT","").strip().upper()
-                if mon_sym in symbol: 
-                    new_coin_bal = get_balance(mon_sym)
-                    sheet.update('H2', [[new_coin_bal]])
+            if h1_val and h1_val.replace("USDT","") in symbol: 
+                new_coin_bal = get_balance(symbol.replace("USDT",""))
+                sheet.update('H2', [[new_coin_bal]])
         except: pass
         
         return jsonify(resp)
 
     except Exception as e:
-        # LOG ERROR WITH CORRECT ALIGNMENT
-        if sheet:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            err_row = [datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0]
-            LOG_QUEUE.append(('LOG', err_row))
-            
+        # QUEUE ERROR
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        err_row = [ts, symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0]
+        LOG_QUEUE.append(('LOG', err_row))
         return jsonify({"error": str(e)}), 500
 
 @app.route('/cli', methods=['POST'])
 def cli():
+    ensure_threads_running()
     data = request.json
     if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
@@ -481,23 +414,15 @@ def cli():
     if method == "get_capital_status":
         try:
             sheet = get_sheet()
-            data = sheet.batch_get(['D2', 'E2', 'H4', 'F2'])
-            
+            data = sheet.batch_get(['D2', 'E2', 'F2'])
             d2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 0)
             e2 = safe_float(data[1][0][0] if (len(data)>1 and data[1]) else 100)
-            
             BOT_MEMORY['d2_cap'] = d2
             BOT_MEMORY['e2_pct'] = e2
-            
             bal = get_balance("USDT")
-            return jsonify({
-                "dedicated_cap": d2, 
-                "reinvest_pct": e2, 
-                "wallet_balance": bal, 
-                "effective_cap": min(d2, bal)
-            })
+            return jsonify({"dedicated_cap": d2, "reinvest_pct": e2, "wallet_balance": bal, "effective_cap": min(d2, bal)})
         except Exception as e:
-             return jsonify({"error": f"Sheet Sync Failed: {str(e)}"}), 500
+             return jsonify({"error": f"Sync Failed: {str(e)}"}), 500
     
     if hasattr(client, method):
         return jsonify(getattr(client, method)(**params))
