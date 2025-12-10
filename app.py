@@ -34,6 +34,9 @@ BOT_MEMORY = {
     "f2_type": "MARKET"
 }
 
+# --- LOGGING QUEUE ---
+LOG_QUEUE = []
+
 # --- HELPERS ---
 def safe_float(value, default=0.0):
     try:
@@ -126,14 +129,12 @@ def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
             new_h4 = old_h4 - cost_sold
             if rem_bal < (coin_qty * 0.02): new_h4 = 0
 
+    # 1. Update RAM (Instant for next trade)
     BOT_MEMORY['d2_cap'] = new_d2
     BOT_MEMORY['h4_cost'] = new_h4
     
-    try:
-        sheet.update('D2', [[new_d2]])
-        sheet.update('H3', [[new_d2]]) 
-        sheet.update('H4', [[new_h4]])
-    except: pass
+    # 2. Queue Sheet Update (Guaranteed Persistence)
+    LOG_QUEUE.append(('STATE', [new_d2, new_h4]))
     
     return new_d2
 
@@ -147,18 +148,49 @@ def init_memory_state():
     except Exception as e:
         print(f"Init State Failed: {e}")
 
-def write_log_row(sheet, row_data):
-    """Writes to the exact next row based on Column A count to prevent gaps"""
-    try:
-        col_a = sheet.col_values(1)
-        next_row = len(col_a) + 1
-        # Protect Headers (Rows 1-5)
-        if next_row < 6: next_row = 6
+def logger_worker():
+    """Handles Log Rows AND State Updates to ensure data consistency"""
+    global LOG_QUEUE
+    print("Logger Thread Started")
+    
+    while True:
+        if len(LOG_QUEUE) > 0:
+            task_type, data = LOG_QUEUE[0] # Peek
+            
+            try:
+                sheet = get_sheet()
+                
+                # --- TASK TYPE 1: LOG ROW ---
+                if task_type == 'LOG':
+                    col_a = sheet.col_values(1)
+                    next_row = len(col_a) + 1
+                    if next_row < 6: next_row = 6
+                    sheet.update(f'A{next_row}:J{next_row}', [data])
+                    print(f"Log Saved. Queue: {len(LOG_QUEUE)-1}")
+
+                # --- TASK TYPE 2: STATE UPDATE (D2, H4) ---
+                elif task_type == 'STATE':
+                    new_d2, new_h4 = data
+                    # Batch update for atomicity
+                    sheet.batch_update([
+                        {'range': 'D2', 'values': [[new_d2]]},
+                        {'range': 'H3', 'values': [[new_d2]]},
+                        {'range': 'H4', 'values': [[new_h4]]}
+                    ])
+                    print(f"State Saved (Cap: {new_d2}). Queue: {len(LOG_QUEUE)-1}")
+
+                # Success: Remove from queue
+                LOG_QUEUE.pop(0)
+                
+            except Exception as e:
+                print(f"Logger Error ({task_type}): {e}")
+                time.sleep(5) # Wait before retry
         
-        sheet.update(f'A{next_row}:J{next_row}', [row_data])
-    except Exception as e:
-        print(f"Write Failed: {e}")
-        sheet.append_row(row_data)
+        time.sleep(1) # CPU Saver
+
+# Start the Logger Thread
+t_log = threading.Thread(target=logger_worker, daemon=True)
+t_log.start()
 
 # --- BACKGROUND TASKS ---
 def background_sync_loop():
@@ -371,8 +403,8 @@ def webhook():
         
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, final_cap]
         
-        # USE THE PRECISION WRITER
-        write_log_row(sheet, row)
+        # Queue Log Row
+        LOG_QUEUE.append(('LOG', row))
         
         # Force H2 Update
         try:
@@ -390,7 +422,8 @@ def webhook():
         # LOG ERROR WITH CORRECT ALIGNMENT
         if sheet:
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            write_log_row(sheet, [ts, symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0])
+            err_row = [datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0]
+            LOG_QUEUE.append(('LOG', err_row))
             
         return jsonify({"error": str(e)}), 500
 
