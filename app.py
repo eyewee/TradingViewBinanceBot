@@ -112,19 +112,19 @@ def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
     global BOT_MEMORY
     
     # D2 now represents "Liquid USDT Available for Bot"
-    current_liquid_cap = BOT_MEMORY['d2_cap']
+    current_cap = BOT_MEMORY['d2_cap']
     new_d2 = current_cap
 
     # LEDGER LOGIC: Pure Cash Flow
     if side == "BUY":
         # Money leaves the pot
-        new_d2 = current_liquid_cap - usdt_value
+        new_d2 = current_cap - usdt_value
         # Safety: Don't let it go negative (e.g. if you bought with external funds)
         if new_d2 < 0: new_d2 = 0
     
     elif side == "SELL":
         # Money enters the pot
-        new_d2 = current_liquid_cap + usdt_value
+        new_d2 = current_cap + usdt_value
 
     # Update Memory
     BOT_MEMORY['d2_cap'] = new_d2
@@ -423,13 +423,28 @@ def cli():
     if method == "get_capital_status":
         try:
             sheet = get_sheet()
-            data = sheet.batch_get(['D2', 'E2', 'F2'])
+            # Added J2 to list
+            data = sheet.batch_get(['D2', 'E2', 'F2', 'J2'])
+            
             d2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 0)
             e2 = safe_float(data[1][0][0] if (len(data)>1 and data[1]) else 100)
+            
+            # Read J2
+            raw_slip = str(data[3][0][0]) if (len(data) > 3 and data[3]) else "0"
+            j2 = safe_float(raw_slip.replace("%", ""))
+            
             BOT_MEMORY['d2_cap'] = d2
             BOT_MEMORY['e2_pct'] = e2
+            BOT_MEMORY['j2_slip'] = j2 # Update Memory
+            
             bal = get_balance("USDT")
-            return jsonify({"dedicated_cap": d2, "reinvest_pct": e2, "wallet_balance": bal, "effective_cap": min(d2, bal)})
+            return jsonify({
+                "dedicated_cap": d2, 
+                "reinvest_pct": e2, 
+                "slippage_tol": j2, # Show in CLI
+                "wallet_balance": bal, 
+                "effective_cap": min(d2, bal)
+            })
         except Exception as e:
              return jsonify({"error": f"Sync Failed: {str(e)}"}), 500
     
