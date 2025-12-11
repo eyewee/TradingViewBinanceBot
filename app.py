@@ -38,10 +38,7 @@ BOT_MEMORY = {
 LOG_QUEUE = []
 
 # --- THREAD CONTROL ---
-THREADS = {
-    "logger": None,
-    "sync": None
-}
+THREADS = { "logger": None, "sync": None }
 
 # --- HELPERS ---
 def safe_float(value, default=0.0):
@@ -61,7 +58,6 @@ def get_sheet():
             GOOGLE_CLIENT = gspread.service_account_from_dict(creds, scopes=SCOPES)
         return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
     except Exception:
-        # Force Reconnect
         creds = json.loads(GOOGLE_JSON)
         GOOGLE_CLIENT = gspread.service_account_from_dict(creds, scopes=SCOPES)
         return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
@@ -111,28 +107,24 @@ def round_step_size(quantity, step_size):
 def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
     global BOT_MEMORY
     
-    # D2 now represents "Liquid USDT Available for Bot"
     current_cap = BOT_MEMORY['d2_cap']
     new_d2 = current_cap
 
-    # LEDGER LOGIC: Pure Cash Flow
+    # SIMPLE CASH FLOW LOGIC
     if side == "BUY":
         # Money leaves the pot
         new_d2 = current_cap - usdt_value
-        # Safety: Don't let it go negative (e.g. if you bought with external funds)
         if new_d2 < 0: new_d2 = 0
     
     elif side == "SELL":
         # Money enters the pot
         new_d2 = current_cap + usdt_value
 
-    # Update Memory
     BOT_MEMORY['d2_cap'] = new_d2
     
-    # Update Sheet (Synchronous Save)
+    # Synchronous Save
     for attempt in range(3):
         try:
-            # We update D2 (Liquid) and H3 (Visual confirmation)
             sheet.batch_update([
                 {'range': 'D2', 'values': [[new_d2]]},
                 {'range': 'H3', 'values': [[new_d2]]}
@@ -145,7 +137,6 @@ def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
 
 # --- WORKER FUNCTIONS ---
 def logger_worker_func():
-    """Consumes the LOG_QUEUE and writes to Google Sheets"""
     global LOG_QUEUE
     print("Logger Thread Started")
     while True:
@@ -158,7 +149,6 @@ def logger_worker_func():
                     next_row = len(col_a) + 1
                     if next_row < 6: next_row = 6
                     sheet.update(f'A{next_row}:J{next_row}', [data])
-                    print(f"Log persisted. Queue size: {len(LOG_QUEUE)-1}")
                 LOG_QUEUE.pop(0)
             except Exception as e:
                 print(f"Logger Retrying: {e}")
@@ -184,12 +174,7 @@ def background_sync_func():
             val_j2 = safe_float(raw_slip.replace("%", ""))
 
             # --- REALITY CHECK ---
-            # If Sheet says we have Capital, but Wallet is empty, trust the Wallet.
-            # This fixes the "Crash -> Restart -> Double Count" bug.
             real_usdt = get_balance("USDT")
-            
-            # Logic: If holding coins (Buy State), D2 might be high but Wallet low.
-            # We take the MINIMUM to ensure we never spend phantom money.
             validated_d2 = min(sheet_d2, real_usdt)
 
             BOT_MEMORY['d2_cap'] = validated_d2
@@ -217,23 +202,17 @@ def background_sync_func():
         tick += 1
         time.sleep(15)
 
-# --- THREAD MANAGER (Gunicorn Fix) ---
 def ensure_threads_running():
     global THREADS
-    
-    # Check Logger
     if THREADS["logger"] is None or not THREADS["logger"].is_alive():
         print("Starting Logger Thread...")
         THREADS["logger"] = threading.Thread(target=logger_worker_func, daemon=True)
         THREADS["logger"].start()
-        
-    # Check Sync
     if THREADS["sync"] is None or not THREADS["sync"].is_alive():
         print("Starting Sync Thread...")
         THREADS["sync"] = threading.Thread(target=background_sync_func, daemon=True)
         THREADS["sync"].start()
 
-# Check on load
 ensure_threads_running()
 
 # --- ROUTES ---
@@ -261,7 +240,6 @@ def webhook():
     usdt_value = 0
     final_cap = 0
     
-    # Init sheet for fallback logic
     try: sheet = get_sheet()
     except: sheet = None
 
@@ -306,22 +284,19 @@ def webhook():
             
             if target_type == 'LIMIT':
                 raw_price = float(data.get('limit_price', sent_price))
-                
-                # --- SLIPPAGE LOGIC (BUY) ---
-                # Example: 100 * (1 + 0.001) = 100.10 (Buying slightly higher to ensure fill)
-                adjusted_price = raw_price * (1 + (j2_slip / 100.0))
+                adj_price = raw_price * (1 + (j2_slip / 100.0))
                 
                 tick_size = get_price_tick_size(symbol)
-                final_limit_price = round_step_size(adjusted_price, tick_size)
+                final_lim = round_step_size(adj_price, tick_size)
                 
-                qty_coins = amt / final_limit_price 
+                qty_coins = amt / final_lim 
                 step = get_symbol_step_size(symbol)
                 qty_coins = round_step_size(qty_coins, step)
                 
                 params['timeInForce'] = data.get('timeInForce', 'GTC')
                 params['quantity'] = qty_coins
-                params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
-                amt = qty_coins * final_limit_price 
+                params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
+                amt = qty_coins * final_lim 
             else:
                 params['quoteOrderQty'] = round(amt, 2)
 
@@ -347,14 +322,12 @@ def webhook():
 
                 if target_type == 'LIMIT':
                     raw_price = float(data.get('limit_price', sent_price))
-                    
-                    # Example: 100 * (1 - 0.001) = 99.90 (Selling slightly lower to ensure fill)
-                    adjusted_price = raw_price * (1 - (j2_slip / 100.0))
+                    adj_price = raw_price * (1 - (j2_slip / 100.0))
                     
                     tick_size = get_price_tick_size(symbol)
-                    final_limit_price = round_step_size(adjusted_price, tick_size)
+                    final_lim = round_step_size(adj_price, tick_size)
                     params['quantity'] = qty
-                    params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
+                    params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
                     params['timeInForce'] = data.get('timeInForce', 'GTC')
                 else:
                     params['quantity'] = qty
@@ -368,13 +341,11 @@ def webhook():
             usdt_value = float(resp['origQty']) * float(resp['price'])
 
         if 'fills' in resp and len(resp['fills']) > 0:
-            # Sum up all chunks to get the TRUE total
-            total_fill_qty = sum(float(f['qty']) for f in resp['fills'])
-            total_fill_quote = sum(float(f['price']) * float(f['qty']) for f in resp['fills'])
-            
-            exec_qty = total_fill_qty
-            # Weighted Average Price
-            exec_price = total_fill_quote / total_fill_qty if total_fill_qty > 0 else 0
+            # Aggregate Fills Logic
+            total_qty = sum(float(f['qty']) for f in resp['fills'])
+            total_quote = sum(float(f['price']) * float(f['qty']) for f in resp['fills'])
+            exec_qty = total_qty
+            exec_price = total_quote / total_qty if total_qty > 0 else 0
         else:
             if status.startswith("Skipped"):
                 exec_price = 0
@@ -393,10 +364,8 @@ def webhook():
         
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, final_cap]
         
-        # QUEUE LOG (Instant Return)
         LOG_QUEUE.append(('LOG', row))
         
-        # H2 Update (Instant if possible)
         try:
             h1_val = sheet.acell('H1').value
             if h1_val and h1_val.replace("USDT","") in symbol: 
@@ -407,10 +376,10 @@ def webhook():
         return jsonify(resp)
 
     except Exception as e:
-        # QUEUE ERROR
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        err_row = [ts, symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0]
-        LOG_QUEUE.append(('LOG', err_row))
+        if sheet:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            err_row = [ts, symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0]
+            LOG_QUEUE.append(('LOG', err_row))
         return jsonify({"error": str(e)}), 500
 
 @app.route('/cli', methods=['POST'])
@@ -428,25 +397,22 @@ def cli():
     if method == "get_capital_status":
         try:
             sheet = get_sheet()
-            # Added J2 to list
             data = sheet.batch_get(['D2', 'E2', 'F2', 'J2'])
             
             d2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 0)
             e2 = safe_float(data[1][0][0] if (len(data)>1 and data[1]) else 100)
-            
-            # Read J2
             raw_slip = str(data[3][0][0]) if (len(data) > 3 and data[3]) else "0"
             j2 = safe_float(raw_slip.replace("%", ""))
             
             BOT_MEMORY['d2_cap'] = d2
             BOT_MEMORY['e2_pct'] = e2
-            BOT_MEMORY['j2_slip'] = j2 # Update Memory
+            BOT_MEMORY['j2_slip'] = j2
             
             bal = get_balance("USDT")
             return jsonify({
                 "dedicated_cap": d2, 
                 "reinvest_pct": e2, 
-                "slippage_tol": j2, # Show in CLI
+                "slippage_tol": j2,
                 "wallet_balance": bal, 
                 "effective_cap": min(d2, bal)
             })
