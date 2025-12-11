@@ -30,7 +30,8 @@ GOOGLE_CLIENT = None
 BOT_MEMORY = {
     "d2_cap": 0.0,
     "e2_pct": 100.0,
-    "f2_type": "MARKET"
+    "f2_type": "MARKET",
+    "j2_slip": 0.0
 }
 
 # --- LOGGING QUEUE ---
@@ -107,44 +108,31 @@ def round_step_size(quantity, step_size):
     precision = int(round(-math.log(float(step_size), 10), 0))
     return float(round(quantity - (quantity % float(step_size)), precision))
 
-def get_cost_basis_from_history(symbol, qty_held):
-    if qty_held <= 0: return 0.0
-    try:
-        trades = client.my_trades(symbol=symbol, limit=20)
-        trades.reverse()
-        cost_accumulated = 0.0
-        qty_needed = qty_held
-        for t in trades:
-            if t['isBuyer']:
-                trade_qty = float(t['qty'])
-                trade_quote = float(t['quoteQty'])
-                if qty_needed <= 0: break
-                if trade_qty >= qty_needed:
-                    fraction = qty_needed / trade_qty
-                    cost_accumulated += (trade_quote * fraction)
-                    qty_needed = 0
-                else:
-                    cost_accumulated += trade_quote
-                    qty_needed -= trade_qty
-        return cost_accumulated
-    except: return 0.0
-
 def update_compounding_after_trade(sheet, side, usdt_value, coin_qty, symbol):
     global BOT_MEMORY
     
-    current_cap = BOT_MEMORY['d2_cap']
+    # D2 now represents "Liquid USDT Available for Bot"
+    current_liquid_cap = BOT_MEMORY['d2_cap']
     new_d2 = current_cap
 
-    if side == "SELL":
-        cost_basis = get_cost_basis_from_history(symbol, coin_qty)
-        profit = usdt_value - cost_basis
-        new_d2 = current_cap + profit
+    # LEDGER LOGIC: Pure Cash Flow
+    if side == "BUY":
+        # Money leaves the pot
+        new_d2 = current_liquid_cap - usdt_value
+        # Safety: Don't let it go negative (e.g. if you bought with external funds)
+        if new_d2 < 0: new_d2 = 0
+    
+    elif side == "SELL":
+        # Money enters the pot
+        new_d2 = current_liquid_cap + usdt_value
 
+    # Update Memory
     BOT_MEMORY['d2_cap'] = new_d2
     
-    # CRITICAL DATA: Sync Save (Retries 3 times)
+    # Update Sheet (Synchronous Save)
     for attempt in range(3):
         try:
+            # We update D2 (Liquid) and H3 (Visual confirmation)
             sheet.batch_update([
                 {'range': 'D2', 'values': [[new_d2]]},
                 {'range': 'H3', 'values': [[new_d2]]}
@@ -178,7 +166,7 @@ def logger_worker_func():
         time.sleep(1)
 
 def background_sync_func():
-    """Syncs settings from Sheet to Memory every 15s"""
+    """Syncs settings from Sheet to Memory every 15s with Reality Check"""
     global BOT_MEMORY
     time.sleep(2) 
     tick = 0 
@@ -186,24 +174,35 @@ def background_sync_func():
         try:
             sheet = get_sheet()
             # Task A: Sync Settings
-            data = sheet.batch_get(['D2', 'E2', 'F2'])
+            data = sheet.batch_get(['D2', 'E2', 'F2', 'J2'])
             
-            # Safe unpack
-            val_d2 = data[0][0][0] if (len(data) > 0 and data[0]) else 0
-            val_e2 = data[1][0][0] if (len(data) > 1 and data[1]) else 100
-            val_f2 = data[2][0][0] if (len(data) > 2 and data[2]) else "MARKET"
+            sheet_d2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 0)
+            val_e2 = safe_float(data[1][0][0] if (len(data) > 1 and data[1]) else 100)
+            val_f2 = str(data[2][0][0]).upper() if (len(data) > 2 and data[2]) else "MARKET"
+            
+            raw_slip = str(data[3][0][0]) if (len(data) > 3 and data[3]) else "0"
+            val_j2 = safe_float(raw_slip.replace("%", ""))
 
-            BOT_MEMORY['d2_cap'] = safe_float(val_d2)
-            BOT_MEMORY['e2_pct'] = safe_float(val_e2)
-            BOT_MEMORY['f2_type'] = str(val_f2).upper()
+            # --- REALITY CHECK ---
+            # If Sheet says we have Capital, but Wallet is empty, trust the Wallet.
+            # This fixes the "Crash -> Restart -> Double Count" bug.
+            real_usdt = get_balance("USDT")
+            
+            # Logic: If holding coins (Buy State), D2 might be high but Wallet low.
+            # We take the MINIMUM to ensure we never spend phantom money.
+            validated_d2 = min(sheet_d2, real_usdt)
+
+            BOT_MEMORY['d2_cap'] = validated_d2
+            BOT_MEMORY['e2_pct'] = val_e2
+            BOT_MEMORY['f2_type'] = val_f2
+            BOT_MEMORY['j2_slip'] = val_j2
 
             # Task B: Dashboard
             if tick % 4 == 0: 
                 try:
-                    usdt = get_balance("USDT")
                     btc = get_coin_price("BTCUSDT")
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sheet.update('A2:C2', [[ts, usdt, btc]])
+                    sheet.update('A2:C2', [[ts, real_usdt, btc]])
                     
                     h1_val = sheet.acell('H1').value
                     if h1_val:
@@ -270,6 +269,7 @@ def webhook():
         d2_cap = BOT_MEMORY['d2_cap']
         e2_pct = BOT_MEMORY['e2_pct']
         f2_type = BOT_MEMORY['f2_type']
+        j2_slip = BOT_MEMORY['j2_slip']
         
         cancel_all_open_orders(symbol)
         
@@ -306,8 +306,13 @@ def webhook():
             
             if target_type == 'LIMIT':
                 raw_price = float(data.get('limit_price', sent_price))
+                
+                # --- SLIPPAGE LOGIC (BUY) ---
+                # Example: 100 * (1 + 0.001) = 100.10 (Buying slightly higher to ensure fill)
+                adjusted_price = raw_price * (1 + (j2_slip / 100.0))
+                
                 tick_size = get_price_tick_size(symbol)
-                final_limit_price = round_step_size(raw_price, tick_size)
+                final_limit_price = round_step_size(adjusted_price, tick_size)
                 
                 qty_coins = amt / final_limit_price 
                 step = get_symbol_step_size(symbol)
@@ -342,8 +347,12 @@ def webhook():
 
                 if target_type == 'LIMIT':
                     raw_price = float(data.get('limit_price', sent_price))
+                    
+                    # Example: 100 * (1 - 0.001) = 99.90 (Selling slightly lower to ensure fill)
+                    adjusted_price = raw_price * (1 - (j2_slip / 100.0))
+                    
                     tick_size = get_price_tick_size(symbol)
-                    final_limit_price = round_step_size(raw_price, tick_size)
+                    final_limit_price = round_step_size(adjusted_price, tick_size)
                     params['quantity'] = qty
                     params['price'] = "{:.8f}".format(final_limit_price).rstrip('0').rstrip('.')
                     params['timeInForce'] = data.get('timeInForce', 'GTC')
