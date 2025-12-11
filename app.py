@@ -368,8 +368,13 @@ def webhook():
             usdt_value = float(resp['origQty']) * float(resp['price'])
 
         if 'fills' in resp and len(resp['fills']) > 0:
-            exec_price = float(resp['fills'][0]['price'])
-            exec_qty = float(resp['fills'][0]['qty'])
+            # Sum up all chunks to get the TRUE total
+            total_fill_qty = sum(float(f['qty']) for f in resp['fills'])
+            total_fill_quote = sum(float(f['price']) * float(f['qty']) for f in resp['fills'])
+            
+            exec_qty = total_fill_qty
+            # Weighted Average Price
+            exec_price = total_fill_quote / total_fill_qty if total_fill_qty > 0 else 0
         else:
             if status.startswith("Skipped"):
                 exec_price = 0
