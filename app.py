@@ -243,7 +243,12 @@ def webhook():
             else:
                 # PURE WALLET MATH: Trade = Wallet * (E2%)
                 req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
-                amt = wallet_usdt * (req_pct / 100.0)
+                
+                # SAFETY BUFFER: If buying 100%, use 99.9% to avoid "Insufficient Balance"
+                if req_pct >= 99.9:
+                    amt = wallet_usdt * 0.999
+                else:
+                    amt = wallet_usdt * (req_pct / 100.0)
                 
                 params = {"symbol": symbol, "side": "BUY", "type": target_type}
                 
