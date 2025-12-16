@@ -203,7 +203,9 @@ def webhook():
     status = "Pending"
     exec_price = 0
     exec_qty = 0
-    wallet_now = 0
+    usdt_value = 0
+    final_cap = 0
+    req_pct = 0
     
     # Init sheet for fallback
     try: sheet = get_sheet()
@@ -283,8 +285,18 @@ def webhook():
                 status = "Skipped: No Coins"
                 resp = {"status": "Skipped", "msg": "No coins"}
             else:
+                # NEW LOGIC: Check for specific Quantity OR Percentage
+                explicit_qty = float(data.get('quantity', 0))
+                # Default to 100% if no specific instruction given
+                sell_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
+                
+                if explicit_qty > 0:
+                    qty = explicit_qty
+                else:
+                    qty = coin_bal * (sell_pct / 100.0)
+
                 step = get_symbol_step_size(symbol)
-                qty = round_step_size(coin_bal, step) 
+                qty = round_step_size(qty, step) 
                 
                 params = {"symbol": symbol, "side": "SELL", "type": target_type}
 
@@ -327,7 +339,7 @@ def webhook():
         wallet_now = get_balance("USDT")
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        applied_pct = f"{req_pct}%" if side == 'BUY' else "100%"
+        applied_pct = f"{req_pct}%" if side == 'BUY' else f"{data.get('PercentAmount', 'Qty')}"
         
         # New Capital Column now simply shows "Wallet Balance"
         row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, wallet_now]

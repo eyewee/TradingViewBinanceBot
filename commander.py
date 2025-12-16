@@ -126,40 +126,87 @@ def check_status():
     return None
 
 def smart_trade(side, symbol, amount_str):
-    """
-    Standard 'buy TRUMPUSDT 10%' logic (Market Order).
-    Sends to /webhook so it logs to sheet and compounds.
-    """
     cap_data = check_status()
     if not cap_data: return
 
     effective_cap = float(cap_data['effective_cap'])
     
-    # Calculate Amount based on CAP
-    req_pct = 0.0
-    if "%" in amount_str:
-        req_pct = float(amount_str.replace("%", ""))
-        print(f"Requested: {req_pct}% of Cap ({effective_cap})")
-    elif amount_str.lower() == "all":
-        req_pct = 100.0
-    else:
-        # If user types raw number "10", calculate what % that is of cap
-        raw_amt = float(amount_str)
-        if effective_cap > 0:
-            req_pct = (raw_amt / effective_cap) * 100.0
-        else:
-            req_pct = 0 # Safety
-
-    # Payload for Webhook
     payload = {
-        "symbol": symbol,
-        "side": side,
+        "symbol": symbol, 
+        "side": side, 
         "type": "MARKET",
-        "PercentAmount": req_pct, # Override the sheet %
-        "reason": "Manual CLI Market"
+        "reason": f"Manual CLI {side}"
     }
 
-    print(f"Sending Market Order -> {side} {symbol} ({req_pct:.2f}% of Cap)...")
+    # --- BUY LOGIC ---
+    if side == "BUY":
+        req_pct = 0.0
+        
+        if "%" in amount_str:
+            req_pct = float(amount_str.replace("%", ""))
+            print(f"Buying: {req_pct}% of Cap")
+            payload["PercentAmount"] = req_pct
+            
+        elif "$" in amount_str:
+            # Buy specific Dollar Amount (e.g. 10$)
+            target_usd = float(amount_str.replace("$", ""))
+            if effective_cap > 0:
+                req_pct = (target_usd / effective_cap) * 100.0
+                print(f"Buying: ${target_usd} ({req_pct:.2f}% of Cap)")
+            payload["PercentAmount"] = req_pct
+            
+        elif amount_str.lower() == "all":
+            payload["PercentAmount"] = 100.0
+            
+        else:
+            # Buy specific Coin Quantity (e.g. 10 Coins)
+            # We must convert coins -> USDT because Binance Market Buy uses quoteOrderQty usually
+            target_coins = float(amount_str)
+            
+            # Fetch Price
+            price_res = send_request("/cli", {"method": "ticker_price", "params": {"symbol": symbol}})
+            price = float(price_res['price'])
+            
+            # Calculate USDT cost
+            cost_usdt = target_coins * price
+            
+            if effective_cap > 0:
+                req_pct = (cost_usdt / effective_cap) * 100.0
+                print(f"Buying: {target_coins} coins (~${cost_usdt:.2f})")
+            
+            payload["PercentAmount"] = req_pct
+
+    # --- SELL LOGIC (Based on COIN QTY) ---
+    elif side == "SELL":
+        if "%" in amount_str:
+            # Percentage of Holdings
+            pct = float(amount_str.replace("%", ""))
+            payload["PercentAmount"] = pct
+            print(f"Selling: {pct}% of Holdings")
+            
+        elif "$" in amount_str:
+            # Sell specific Dollar Value (e.g. 10$)
+            target_usd = float(amount_str.replace("$", ""))
+            
+            # Fetch Price to convert USD -> Qty
+            price_res = send_request("/cli", {"method": "ticker_price", "params": {"symbol": symbol}})
+            price = float(price_res['price'])
+            qty = target_usd / price
+            
+            payload["quantity"] = qty
+            print(f"Selling: ${target_usd} value (~{qty:.6f} coins @ {price})")
+            
+        elif amount_str.lower() == "all":
+            payload["PercentAmount"] = 100.0
+            print("Selling: 100% of Holdings")
+            
+        else:
+            # Assume raw number is Coin Quantity
+            qty = float(amount_str)
+            payload["quantity"] = qty
+            print(f"Selling: {qty} coins")
+
+    # Execute
     res = send_request("/webhook", payload)
     format_execution(res)
 
