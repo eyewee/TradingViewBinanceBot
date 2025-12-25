@@ -120,7 +120,7 @@ def logger_worker_func():
                     col_a = sheet.col_values(1)
                     next_row = len(col_a) + 1
                     if next_row < 6: next_row = 6
-                    sheet.update(f'A{next_row}:J{next_row}', [data])
+                    sheet.update(f'A{next_row}:K{next_row}', [data])
                 LOG_QUEUE.pop(0)
             except Exception as e:
                 print(f"Logger Retrying: {e}")
@@ -136,7 +136,7 @@ def background_sync_func():
         try:
             sheet = get_sheet()
             # Task A: Sync Settings (Ignore D2)
-            data = sheet.batch_get(['E2', 'F2', 'J2'])
+            data = sheet.batch_get(['E2', 'G2', 'K2'])
             
             val_e2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 100)
             val_f2 = str(data[1][0][0]).upper() if (len(data) > 1 and data[1]) else "MARKET"
@@ -155,11 +155,11 @@ def background_sync_func():
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     sheet.update('A2:C2', [[ts, usdt, btc]])
                     
-                    h1_val = sheet.acell('H1').value
+                    h1_val = sheet.acell('I1').value
                     if h1_val:
                         mon_sym = h1_val.replace("USDT","").strip().upper()
                         c_bal = get_balance(mon_sym)
-                        sheet.update('H2', [[c_bal]])
+                        sheet.update('I2', [[c_bal]])
                 except: pass
         except Exception as e:
             print(f"Sync Error: {e}")
@@ -196,6 +196,7 @@ def webhook():
     
     raw_s = data['symbol'].upper().replace("/", "")
     symbol = raw_s + "T" if raw_s.endswith("USD") and not raw_s.endswith("USDT") else raw_s
+    market_price = get_coin_price(symbol)
     side = data['side'].upper()
     sent_price = data.get('price', 'Market')
     reason = data.get('reason', '') 
@@ -210,6 +211,7 @@ def webhook():
     # Init sheet for fallback
     try: sheet = get_sheet()
     except: sheet = None
+
 
     try:
         # 1. READ SETTINGS
@@ -342,15 +344,15 @@ def webhook():
         applied_pct = f"{req_pct}%" if side == 'BUY' else f"{data.get('PercentAmount', 'Qty')}"
         
         # New Capital Column now simply shows "Wallet Balance"
-        row = [ts, symbol, side, applied_pct, sent_price, exec_price, exec_qty, status, reason, wallet_now]
+        row = [ts, symbol, side, applied_pct, sent_price, market_price, exec_price, exec_qty, status, reason, wallet_now]
         LOG_QUEUE.append(('LOG', row))
         
         # H2 Update
         try:
-            h1_val = sheet.acell('H1').value
+            h1_val = sheet.acell('I1').value
             if h1_val and h1_val.replace("USDT","") in symbol: 
                 new_coin_bal = get_balance(symbol.replace("USDT",""))
-                sheet.update('H2', [[new_coin_bal]])
+                sheet.update('I2', [[new_coin_bal]])
         except: pass
         
         return jsonify(resp)
@@ -358,7 +360,7 @@ def webhook():
     except Exception as e:
         if sheet:
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            err_row = [ts, symbol, "ERROR", 0, 0, 0, 0, str(e), 0, 0]
+            err_row = [ts, symbol, "ERROR", 0, 0, 0, 0, 0, str(e), 0, 0]
             LOG_QUEUE.append(('LOG', err_row))
         return jsonify({"error": str(e)}), 500
 
@@ -377,7 +379,7 @@ def cli():
     if method == "get_capital_status":
         try:
             sheet = get_sheet()
-            data = sheet.batch_get(['E2', 'F2', 'J2'])
+            data = sheet.batch_get(['E2', 'G2', 'K2'])
             
             e2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 100)
             
