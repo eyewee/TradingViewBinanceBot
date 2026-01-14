@@ -4,7 +4,6 @@ import json
 import datetime
 import time
 import threading
-import requests
 from flask import Flask, request, jsonify
 from binance.spot import Spot
 from binance.error import ClientError
@@ -24,18 +23,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-# Create a persistent session to avoid 100ms delay if binance connection went to sleep
-session = requests.Session()
-session.headers.update({
-    "Content-Type": "application/json",
-    "User-Agent": "binance-connector-python"
-})
-
 client = Spot(
     api_key=API_KEY, 
     api_secret=API_SECRET, 
-    base_url=BASE_URL,
-    session=session  # <--- PASSING THE SESSION
+    base_url=BASE_URL
 )
 
 GOOGLE_CLIENT = None
