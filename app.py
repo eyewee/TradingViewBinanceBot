@@ -23,15 +23,36 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
+# Create a persistent session to avoid 100ms delay if binance connection went to sleep
+session = requests.Session()
+session.headers.update({
+    "Content-Type": "application/json",
+    "User-Agent": "binance-connector-python"
+})
+
+client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL, session=session)
 GOOGLE_CLIENT = None
 
-# --- IN-MEMORY CACHE (Settings Only) ---
-BOT_MEMORY = {
+# --- ADVANCED MEMORY BRAIN ---
+# 1. Settings (Synced from Google Sheets)
+BOT_SETTINGS = {
     "e2_pct": 100.0,
     "f2_type": "MARKET",
     "j2_slip": 0.0
 }
+
+# 2. State (Tracks "HOLDING" vs "EMPTY" and "pending_limit")
+# Structure: { "BTCUSDT": { "status": "EMPTY", "pending_limit": False } }
+BOT_STATE = {}
+
+# 3. Cache (Stores Exchange Info & Balances to avoid API calls)
+CACHE = {
+    "exchange_info": {},    # Stores stepSize, tickSize per symbol
+    "wallet": {"USDT": 0.0} # Stores balances: {"USDT": 1000.0, "BTC": 0.001}
+}
+
+# 4. Thread Safety
+STATE_LOCK = threading.Lock()
 
 # --- LOGGING QUEUE ---
 LOG_QUEUE = []
@@ -61,16 +82,6 @@ def get_sheet():
         GOOGLE_CLIENT = gspread.service_account_from_dict(creds, scopes=SCOPES)
         return GOOGLE_CLIENT.open("TradingBotLog").worksheet("Dashboard")
 
-def get_balance(asset):
-    """Robust balance checker"""
-    for attempt in range(3):
-        try:
-            acct = client.account()
-            for a in acct['balances']:
-                if a['asset'] == asset: return float(a['free'])
-            return 0.0
-        except: time.sleep(0.5)
-    return 0.0
 
 def cancel_all_open_orders(symbol):
     try:
@@ -86,21 +97,23 @@ def get_coin_price(symbol):
         return float(client.ticker_price(symbol=symbol)['price'])
     except: return 0.0
 
-def get_symbol_step_size(symbol):
-    try:
-        info = client.exchange_info(symbol=symbol)
-        for f in info['symbols'][0]['filters']:
-            if f['filterType'] == 'LOT_SIZE': return f['stepSize']
-    except: pass
-    return '0.00001'
+def get_cached_step(symbol):
+    """Returns step size from RAM (Instant)"""
+    return CACHE['exchange_info'].get(symbol, {'step': '0.00001'})['step']
 
-def get_price_tick_size(symbol):
-    try:
-        info = client.exchange_info(symbol=symbol)
-        for f in info['symbols'][0]['filters']:
-            if f['filterType'] == 'PRICE_FILTER': return f['tickSize']
-    except: pass
-    return '0.000001'
+def get_cached_tick(symbol):
+    """Returns tick size from RAM (Instant)"""
+    return CACHE['exchange_info'].get(symbol, {'tick': '0.000001'})['tick']
+
+def get_state(symbol):
+    """Returns or initializes state for a symbol"""
+    if symbol not in BOT_STATE:
+        BOT_STATE[symbol] = {"status": "EMPTY", "pending_limit": False}
+    return BOT_STATE[symbol]
+
+def get_cached_balance(asset):
+    """Returns balance from RAM"""
+    return CACHE['wallet'].get(asset, 0.0)
 
 def round_step_size(quantity, step_size):
     precision = int(round(-math.log(float(step_size), 10), 0))
@@ -128,45 +141,96 @@ def logger_worker_func():
         time.sleep(1)
 
 def background_sync_func():
-    """Syncs settings (E2, F2, J2) and Updates Dashboard"""
-    global BOT_MEMORY
-    time.sleep(2) 
+    """Syncs settings, Updates Dashboard, and Refreshes Wallet Cache"""
+    time.sleep(5) 
     tick = 0 
     while True:
         try:
-            sheet = get_sheet()
-            # Task A: Sync Settings (Ignore D2)
-            data = sheet.batch_get(['E2', 'G2', 'K2'])
-            
-            val_e2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 100)
-            val_f2 = str(data[1][0][0]).upper() if (len(data) > 1 and data[1]) else "MARKET"
-            raw_slip = str(data[2][0][0]) if (len(data) > 2 and data[2]) else "0"
-            val_j2 = safe_float(raw_slip.replace("%", ""))
+            # --- TASK A: Sync Settings from Google (Every 10s) ---
+            if tick % 2 == 0: 
+                sheet = get_sheet()
+                data = sheet.batch_get(['E2', 'G2', 'K2'])
+                val_e2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 100)
+                val_f2 = str(data[1][0][0]).upper() if (len(data) > 1 and data[1]) else "MARKET"
+                val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data) > 2 and data[2]) else 0)
+                
+                with STATE_LOCK:
+                    BOT_SETTINGS['e2_pct'] = val_e2
+                    BOT_SETTINGS['f2_type'] = val_f2
+                    BOT_SETTINGS['j2_slip'] = val_j2
 
-            BOT_MEMORY['e2_pct'] = val_e2
-            BOT_MEMORY['f2_type'] = val_f2
-            BOT_MEMORY['j2_slip'] = val_j2
-
-            # Task B: Dashboard
-            if tick % 4 == 0: 
+            # --- TASK B: Refresh Wallet Cache (Every 30s) ---
+            if tick % 6 == 0:
                 try:
-                    usdt = get_balance("USDT")
-                    btc = get_coin_price("BTCUSDT")
-                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sheet.update('A2:C2', [[ts, usdt, btc]])
-                    
-                    h1_val = sheet.acell('I1').value
-                    if h1_val:
-                        mon_sym = h1_val.replace("USDT","").strip().upper()
-                        c_bal = get_balance(mon_sym)
-                        sheet.update('I2', [[c_bal]])
-                except: pass
+                    acct = client.account()
+                    with STATE_LOCK:
+                        # Reset cache slightly to ensure fresh data
+                        for b in acct['balances']:
+                            CACHE['wallet'][b['asset']] = float(b['free'])
+                except Exception as e:
+                    print(f"Wallet Sync Error: {e}")
+
+            # --- TASK C: Update Dashboard (Visuals) ---
+            if tick % 6 == 0:
+                sheet = get_sheet()
+                usdt = CACHE['wallet'].get('USDT', 0)
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sheet.update('A2:B2', [[ts, usdt]])
+                
+                # Update coin balance on dashboard (H2/I2)
+                h1_val = sheet.acell('I1').value
+                if h1_val:
+                    mon_sym = h1_val.replace("USDT","").strip().upper()
+                    c_bal = CACHE['wallet'].get(mon_sym, 0.0)
+                    sheet.update('I2', [[c_bal]])
+
         except Exception as e:
             print(f"Sync Error: {e}")
-            time.sleep(60)
+            time.sleep(10)
         
         tick += 1
-        time.sleep(15)
+        time.sleep(5)
+
+def initialize_runtime():
+    """Runs once on startup to load Cache and State."""
+    print("--- INITIALIZING BOT STATE ---")
+    try:
+        # 1. Load Exchange Info (Heavy payload, done once)
+        info = client.exchange_info()
+        for s in info['symbols']:
+            sym = s['symbol']
+            step = '0.00001'
+            tick = '0.000001'
+            for f in s['filters']:
+                if f['filterType'] == 'LOT_SIZE': step = f['stepSize']
+                if f['filterType'] == 'PRICE_FILTER': tick = f['tickSize']
+            CACHE['exchange_info'][sym] = {'step': step, 'tick': tick}
+        print(f"Loaded Info for {len(CACHE['exchange_info'])} symbols.")
+
+        # 2. Check Real Balances & Open Orders
+        acct = client.account()
+        for b in acct['balances']:
+            asset = b['asset']
+            free = float(b['free'])
+            locked = float(b['locked'])
+            if free > 0 or locked > 0:
+                CACHE['wallet'][asset] = free
+
+        # 3. Check Open Orders to set pending_limit flag
+        open_orders = client.get_open_orders()
+        # Mark symbols that have open orders
+        pending_map = {o['symbol']: True for o in open_orders}
+        
+        # Initialize BOT_STATE based on open orders
+        for sym in pending_map:
+            BOT_STATE[sym] = {"status": "HOLDING", "pending_limit": True}
+            
+        print("Initialization Complete.")
+    except Exception as e:
+        print(f"Init Failed: {e}")
+
+# Run it immediately
+initialize_runtime()
 
 def ensure_threads_running():
     global THREADS
@@ -194,131 +258,146 @@ def webhook():
     data = request.get_json(force=True)
     if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
+    # 1. PARSE SYMBOLS
     raw_s = data['symbol'].upper().replace("/", "")
     symbol = raw_s + "T" if raw_s.endswith("USD") and not raw_s.endswith("USDT") else raw_s
-    market_price = get_coin_price(symbol)
     side = data['side'].upper()
+    base_asset = symbol.replace("USDT", "")
+    
+    # 2. READ MEMORY & CHECK DOUBLE ALERTS (INSTANT)
+    with STATE_LOCK:
+        state = get_state(symbol)
+        current_status = state['status']
+        pending_limit = state['pending_limit']
+        
+        e2_pct = BOT_SETTINGS['e2_pct']
+        f2_type = BOT_SETTINGS['f2_type']
+        j2_slip = BOT_SETTINGS['j2_slip']
+
+    # --- BLOCK: DOUBLE ALERT PROTECTION ---
+    if side == 'BUY' and current_status == 'HOLDING':
+        reason = "Skipped: Already Holding (Memory)"
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, 0, 0, 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
+        return jsonify({"status": "skipped", "msg": reason})
+
+    if side == 'SELL' and current_status == 'EMPTY':
+        reason = "Skipped: Already Empty (Memory)"
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, 0, 0, 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
+        return jsonify({"status": "skipped", "msg": reason})
+
+    # 3. SMART BLIND CANCEL
+    # Only cancel if we think we have a limit order pending
+    if pending_limit:
+        try: client.cancel_open_orders(symbol=symbol)
+        except: pass 
+
+    # 4. PREPARE EXECUTION
     sent_price = data.get('price', 'Market')
-    reason = data.get('reason', '') 
+    payload_type = data.get('type', 'MARKET').upper()
+    target_type = payload_type
     
-    status = "Pending"
-    exec_price = 0
-    exec_qty = 0
-    usdt_value = 0
-    final_cap = 0
-    req_pct = 0
+    # Override if Google Settings say LIMIT (unless Manual CLI)
+    is_manual_cli = "CLI" in data.get('reason', '')
+    if not is_manual_cli and payload_type == 'MARKET' and 'LIMIT' in f2_type:
+        if sent_price != 'Market' and safe_float(sent_price) > 0:
+            target_type = 'LIMIT'
     
-    # Init sheet for fallback
-    try: sheet = get_sheet()
-    except: sheet = None
-
-
     try:
-        # 1. READ SETTINGS
-        e2_pct = BOT_MEMORY['e2_pct']
-        f2_type = BOT_MEMORY['f2_type']
-        j2_slip = BOT_MEMORY['j2_slip']
+        resp = {}
+        status = "Pending"
         
-        # 2. CHECK COIN HOLDINGS & CANCEL
-        base_asset = symbol.replace("USDT","")
-        cancel_all_open_orders(symbol)
-        
-        # Get fresh balances AFTER cancel
-        coin_bal = get_balance(base_asset)
-        wallet_usdt = get_balance("USDT")
-        
-        # 3. ORDER TYPE LOGIC
-        payload_type = data.get('type', 'MARKET').upper()
-        target_type = payload_type
-        is_manual_cli = "CLI" in reason
-        
-        if not is_manual_cli and payload_type == 'MARKET' and 'LIMIT' in f2_type:
-            if sent_price != 'Market' and safe_float(sent_price) > 0:
-                target_type = 'LIMIT'
-
-        # 4. BUY LOGIC
+        # --- BUY LOGIC ---
         if side == 'BUY':
-            # Check Holdings (approx value > 5 USD) to prevent double buy
-            coin_val_approx = coin_bal * safe_float(sent_price if sent_price != 'Market' else 0)
+            wallet_usdt = get_cached_balance("USDT")
+            req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
             
-            if coin_val_approx > 5:
-                status = "Skipped: Already Holding"
-                resp = {"status": "skipped", "msg": f"Holdings {coin_val_approx:.2f} > 5"}
+            # Logic: Use quoteOrderQty (USDT amount)
+            amt_usdt = wallet_usdt * (req_pct / 100.0)
+            if req_pct >= 99.9: amt_usdt = wallet_usdt * 0.998 # Buffer for fees
+            
+            if amt_usdt < 5:
+                raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
+
+            params = {"symbol": symbol, "side": "BUY", "type": target_type}
+
+            if target_type == 'LIMIT':
+                # For Limit, we need price + coin quantity
+                raw_price = float(data.get('limit_price', sent_price))
+                if raw_price == 0: raw_price = get_coin_price(symbol) # Fallback slow call
+                
+                adj_price = raw_price * (1 + (j2_slip / 100.0))
+                tick_size = get_cached_tick(symbol)
+                final_lim = round_step_size(adj_price, tick_size)
+                
+                # Calc Quantity: USDT / Price
+                qty_coins = amt_usdt / final_lim
+                step = get_cached_step(symbol)
+                qty_coins = round_step_size(qty_coins, step)
+                
+                params['timeInForce'] = data.get('timeInForce', 'GTC')
+                params['quantity'] = qty_coins
+                params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
             else:
-                # PURE WALLET MATH: Trade = Wallet * (E2%)
-                req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
-                
-                # SAFETY BUFFER: If buying 100%, use 99.9% to avoid "Insufficient Balance"
-                if req_pct >= 99.9:
-                    amt = wallet_usdt * 0.999
-                else:
-                    amt = wallet_usdt * (req_pct / 100.0)
-                
-                params = {"symbol": symbol, "side": "BUY", "type": target_type}
-                
-                if target_type == 'LIMIT':
-                    raw_price = float(data.get('limit_price', sent_price))
-                    adj_price = raw_price * (1 + (j2_slip / 100.0))
-                    
-                    tick_size = get_price_tick_size(symbol)
-                    final_lim = round_step_size(adj_price, tick_size)
-                    
-                    qty_coins = amt / final_lim 
-                    step = get_symbol_step_size(symbol)
-                    qty_coins = round_step_size(qty_coins, step)
-                    
-                    params['timeInForce'] = data.get('timeInForce', 'GTC')
-                    params['quantity'] = qty_coins
-                    params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
-                    amt = qty_coins * final_lim 
-                else:
-                    params['quoteOrderQty'] = round(amt, 2)
+                # INSTANT MARKET BUY
+                params['quoteOrderQty'] = round(amt_usdt, 2)
 
-                if amt > 10:
-                    resp = client.new_order(**params)
-                    status = "Filled/Open"
-                else:
-                    status = f"Skipped: Amt {amt:.2f} < 10 (Wallet: {wallet_usdt})"
-                    resp = {"status": "skipped", "msg": status}
+            resp = client.new_order(**params)
+            status = "Filled/Open"
+            
+            # MEMORY UPDATE
+            with STATE_LOCK:
+                BOT_STATE[symbol]['status'] = "HOLDING"
+                BOT_STATE[symbol]['pending_limit'] = (target_type == 'LIMIT')
 
-        # 5. SELL LOGIC
+        # --- SELL LOGIC ---
         elif side == 'SELL':
+            coin_bal = get_cached_balance(base_asset)
             if coin_bal == 0:
-                status = "Skipped: No Coins"
-                resp = {"status": "Skipped", "msg": "No coins"}
+                 raise Exception("Cache says 0 coins")
+
+            # Logic: Use Coin Quantity from Cache
+            explicit_qty = float(data.get('quantity', 0))
+            sell_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
+            
+            if explicit_qty > 0: qty = explicit_qty
+            else: qty = coin_bal * (sell_pct / 100.0)
+
+            step = get_cached_step(symbol)
+            qty = round_step_size(qty, step) 
+            
+            params = {"symbol": symbol, "side": "SELL", "type": target_type}
+
+            if target_type == 'LIMIT':
+                raw_price = float(data.get('limit_price', sent_price))
+                if raw_price == 0: raw_price = get_coin_price(symbol) # Fallback
+                
+                adj_price = raw_price * (1 - (j2_slip / 100.0))
+                tick_size = get_cached_tick(symbol)
+                final_lim = round_step_size(adj_price, tick_size)
+                
+                params['quantity'] = qty
+                params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
+                params['timeInForce'] = data.get('timeInForce', 'GTC')
             else:
-                # NEW LOGIC: Check for specific Quantity OR Percentage
-                explicit_qty = float(data.get('quantity', 0))
-                # Default to 100% if no specific instruction given
-                sell_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
-                
-                if explicit_qty > 0:
-                    qty = explicit_qty
-                else:
-                    qty = coin_bal * (sell_pct / 100.0)
+                # INSTANT MARKET SELL
+                params['quantity'] = qty
+            
+            resp = client.new_order(**params)  
+            status = "Filled"
 
-                step = get_symbol_step_size(symbol)
-                qty = round_step_size(qty, step) 
-                
-                params = {"symbol": symbol, "side": "SELL", "type": target_type}
+            # MEMORY UPDATE
+            with STATE_LOCK:
+                BOT_STATE[symbol]['status'] = "EMPTY"
+                BOT_STATE[symbol]['pending_limit'] = (target_type == 'LIMIT')
 
-                if target_type == 'LIMIT':
-                    raw_price = float(data.get('limit_price', sent_price))
-                    adj_price = raw_price * (1 - (j2_slip / 100.0))
-                    tick_size = get_price_tick_size(symbol)
-                    final_lim = round_step_size(adj_price, tick_size)
-                    params['quantity'] = qty
-                    params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
-                    params['timeInForce'] = data.get('timeInForce', 'GTC')
-                else:
-                    params['quantity'] = qty
-                
-                resp = client.new_order(**params)  
-                status = "Filled"
-
-        # --- AGGREGATION & LOGGING ---
+        # 5. AGGREGATION & LOGGING
         total_qty = 0.0
         total_quote = 0.0
+        exec_price = 0.0
+        exec_qty = 0.0
+        
         if 'fills' in resp:
             for f in resp['fills']:
                 total_qty += float(f['qty'])
@@ -329,39 +408,23 @@ def webhook():
             exec_price = total_quote / total_qty
         else:
             exec_qty = float(resp.get('origQty', 0))
-            if status.startswith("Skipped"):
-                exec_price = 0
-            else:
-                if target_type == 'LIMIT' and 'price' in params:
-                    exec_price = float(params['price'])
-                else:
-                    exec_price = safe_float(sent_price) if sent_price != 'Market' else 0
-
-        # Current Wallet for Log (Visual Reference Only)
-        wallet_now = get_balance("USDT")
+            # If Limit, use the price we sent
+            if 'price' in params: exec_price = float(params['price'])
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        applied_pct = f"{req_pct}%" if side == 'BUY' else f"{data.get('PercentAmount', 'Qty')}"
+        reason = data.get('reason', '')
+        wallet_now = get_cached_balance("USDT")
         
-        # New Capital Column now simply shows "Wallet Balance"
-        row = [ts, symbol, side, applied_pct, sent_price, market_price, exec_price, exec_qty, status, reason, wallet_now]
+        row = [ts, symbol, side, f"{req_pct if side=='BUY' else sell_pct}%", sent_price, 0, exec_price, exec_qty, status, reason, wallet_now]
         LOG_QUEUE.append(('LOG', row))
-        
-        # H2 Update
-        try:
-            h1_val = sheet.acell('I1').value
-            if h1_val and h1_val.replace("USDT","") in symbol: 
-                new_coin_bal = get_balance(symbol.replace("USDT",""))
-                sheet.update('I2', [[new_coin_bal]])
-        except: pass
         
         return jsonify(resp)
 
     except Exception as e:
-        if sheet:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            err_row = [ts, symbol, "ERROR", 0, 0, 0, 0, 0, str(e), 0, 0]
-            LOG_QUEUE.append(('LOG', err_row))
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, 0, 0, 0, 0, str(e), 0, 0]))
+        # Revert state on error if needed? 
+        # Actually safer to let background thread fix it later, or manually fix via CLI
         return jsonify({"error": str(e)}), 500
 
 @app.route('/cli', methods=['POST'])
@@ -373,20 +436,24 @@ def cli():
     method = data.get('method')
     params = data.get('params', {})
     
+    # 1. Debug Memory: Return all 3 memory stores
     if method == "debug_memory":
-        return jsonify(BOT_MEMORY)
+        return jsonify({
+            "settings": BOT_SETTINGS,
+            "state": BOT_STATE,
+            "cache_wallet": CACHE['wallet']
+        })
     
+    # 2. Get Capital Status: FIXED to use Cache and Settings
     if method == "get_capital_status":
         try:
-            sheet = get_sheet()
-            data = sheet.batch_get(['E2', 'G2', 'K2'])
+            # We use cached values for speed, or you could force a sheet read here if you prefer
+            # Let's use the RAM values which are synced every 10s
+            e2 = BOT_SETTINGS['e2_pct']
             
-            e2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 100)
+            # Use Cached Balance
+            bal = get_cached_balance("USDT")
             
-            BOT_MEMORY['e2_pct'] = e2
-            
-            bal = get_balance("USDT")
-            # Dedicated Cap is now just Wallet Balance
             return jsonify({
                 "dedicated_cap": bal, 
                 "reinvest_pct": e2, 
@@ -394,8 +461,22 @@ def cli():
                 "effective_cap": bal
             })
         except Exception as e:
-             return jsonify({"error": f"Sync Failed: {str(e)}"}), 500
+             return jsonify({"error": f"Status Check Failed: {str(e)}"}), 500
     
+    # 3. Reset State (Manual Fix)
+    if method == "reset_state":
+        # Params: symbol, status (EMPTY/HOLDING)
+        target_sym = params.get('symbol')
+        new_status = params.get('status')
+        if target_sym and new_status in ['EMPTY', 'HOLDING']:
+            with STATE_LOCK:
+                if target_sym not in BOT_STATE: BOT_STATE[target_sym] = {}
+                BOT_STATE[target_sym]['status'] = new_status
+                BOT_STATE[target_sym]['pending_limit'] = False
+            return jsonify({"msg": f"State updated for {target_sym} to {new_status}"})
+        return jsonify({"error": "Invalid params"}), 400
+    
+    # 4. Standard Binance Methods
     if hasattr(client, method):
         return jsonify(getattr(client, method)(**params))
     
