@@ -193,7 +193,7 @@ def initialize_runtime():
     """Runs once on startup to load Cache and State."""
     print("--- INITIALIZING BOT STATE ---")
     try:
-        # 1. Load Exchange Info (Heavy payload, done once)
+        # 1. Load Exchange Info
         info = client.exchange_info()
         for s in info['symbols']:
             sym = s['symbol']
@@ -205,22 +205,32 @@ def initialize_runtime():
             CACHE['exchange_info'][sym] = {'step': step, 'tick': tick}
         print(f"Loaded Info for {len(CACHE['exchange_info'])} symbols.")
 
-        # 2. Check Real Balances & Open Orders
+        # 2. Check Real Balances & Set HOLDING State
         acct = client.account()
         for b in acct['balances']:
             asset = b['asset']
             free = float(b['free'])
             locked = float(b['locked'])
-            if free > 0 or locked > 0:
+            total = free + locked
+            
+            # Store in Cache
+            if total > 0:
                 CACHE['wallet'][asset] = free
+            
+            # CRITICAL FIX: If we have coins, tell the Bot we are HOLDING
+            # We assume the pair is ASSET + USDT
+            if asset != 'USDT' and total > 0:
+                # We can't know for sure if it's > $5 without price, but 
+                # it is safer to assume HOLDING than EMPTY if we have balance.
+                implied_symbol = f"{asset}USDT"
+                BOT_STATE[implied_symbol] = {"status": "HOLDING", "pending_limit": False}
+                print(f"Detected existing holding: {implied_symbol}")
 
-        # 3. Check Open Orders to set pending_limit flag
+        # 3. Check Open Orders (Overrides previous state if needed)
         open_orders = client.get_open_orders()
-        # Mark symbols that have open orders
-        pending_map = {o['symbol']: True for o in open_orders}
-        
-        # Initialize BOT_STATE based on open orders
-        for sym in pending_map:
+        for o in open_orders:
+            sym = o['symbol']
+            # If we have an order, we are definitely involved with this coin
             BOT_STATE[sym] = {"status": "HOLDING", "pending_limit": True}
             
         print("Initialization Complete.")
@@ -422,8 +432,8 @@ def webhook():
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, 0, 0, 0, 0, str(e), 0, 0]))
         # Revert state on error if needed? 
-        # Actually safer to let background thread fix it later, or manually fix via CLI
-        return jsonify({"error": str(e)}), 500
+        # Return 200 so TradingView thinks we succeeded and DOES NOT retry
+        return jsonify({"status": "error", "msg": str(e)}), 200
 
 @app.route('/cli', methods=['POST'])
 def cli():
