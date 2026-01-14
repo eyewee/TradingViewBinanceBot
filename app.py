@@ -4,6 +4,7 @@ import json
 import datetime
 import time
 import threading
+import requests
 from flask import Flask, request, jsonify
 from binance.spot import Spot
 from binance.error import ClientError
@@ -30,7 +31,13 @@ session.headers.update({
     "User-Agent": "binance-connector-python"
 })
 
-client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL, session=session)
+client = Spot(
+    api_key=API_KEY, 
+    api_secret=API_SECRET, 
+    base_url=BASE_URL,
+    session=session  # <--- PASSING THE SESSION
+)
+
 GOOGLE_CLIENT = None
 
 # --- ADVANCED MEMORY BRAIN ---
