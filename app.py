@@ -294,7 +294,7 @@ def webhook():
     data = request.get_json(force=True)
     if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
     
-    # 1. PARSE EVERYTHING FIRST (So logs are always complete)
+    # 1. PARSE EVERYTHING FIRST
     raw_s = data['symbol'].upper().replace("/", "")
     symbol = raw_s + "T" if raw_s.endswith("USD") and not raw_s.endswith("USDT") else raw_s
     side = data['side'].upper()
@@ -304,13 +304,10 @@ def webhook():
     payload_type = data.get('type', 'MARKET').upper()
     target_type = payload_type
     
-    # Get the incoming Signal Name (e.g. "E-2", "SL")
     incoming_reason = data.get('reason', '')
-    
-    # Detect if this is a Manual Command from Commander.py
     is_manual_cli = "CLI" in incoming_reason
 
-    # Override target type if Settings say LIMIT (only for Automation)
+    # Settings Override
     if not is_manual_cli:
         with STATE_LOCK:
             f2_type = BOT_SETTINGS['f2_type']
@@ -321,33 +318,29 @@ def webhook():
              if sent_price != 'Market' and safe_float(sent_price) > 0:
                 target_type = 'LIMIT'
     else:
-        # CLI defaults
         e2_pct = 100.0
         j2_slip = 0.0
 
-    # 2. READ MEMORY (For Automation Safety)
+    # 2. READ MEMORY
     with STATE_LOCK:
         state = get_state(symbol)
         current_status = state['status']
         pending_limit = state['pending_limit']
 
-    # --- BLOCK: DOUBLE ALERT PROTECTION (Bypassed by CLI) ---
+    # --- BLOCK: DOUBLE ALERT PROTECTION ---
     if not is_manual_cli:
+        # BUY: Strict Protection (Prevent Double Buy)
         if side == 'BUY' and current_status == 'HOLDING':
             skip_msg = f"{incoming_reason} | Skipped: Already Holding (Memory)"
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Log with Price and Incoming Reason
             LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, sent_price, "", 0, 0, "Skipped", skip_msg, get_cached_balance("USDT")]))
             return jsonify({"status": "skipped", "msg": skip_msg})
 
-        if side == 'SELL' and current_status == 'EMPTY':
-            skip_msg = f"{incoming_reason} | Skipped: Already Empty (Memory)"
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, sent_price, "", 0, 0, "Skipped", skip_msg, get_cached_balance("USDT")]))
-            return jsonify({"status": "skipped", "msg": skip_msg})
+        # SELL: REMOVED PROTECTION
+        # We allow ALL Sells to proceed. The logic below will verify if we actually have coins.
+        # This prevents the "Deadlock" where the bot refuses to sell because it *thinks* it's empty.
 
     # 3. SMART BLIND CANCEL
-    # If CLI, we always cancel to clear the path. If Auto, only if pending.
     if is_manual_cli or pending_limit:
         try: client.cancel_open_orders(symbol=symbol)
         except: pass 
@@ -360,7 +353,6 @@ def webhook():
         
         # --- BUY LOGIC ---
         if side == 'BUY':
-            # GOD MODE: Force Refresh Balance if CLI
             if is_manual_cli:
                 try: 
                     fresh_bal = float(client.account()['balances'][next(i for i, x in enumerate(client.account()['balances']) if x['asset'] == 'USDT')]['free'])
@@ -373,7 +365,7 @@ def webhook():
             amt_usdt = wallet_usdt * (req_pct / 100.0)
             if req_pct >= 99.9: amt_usdt = wallet_usdt * 0.998
             
-            # Auto-Recovery for Automation if cache is stale
+            # Auto-Recovery
             if not is_manual_cli and amt_usdt < 5:
                 try: 
                     fresh_bal = float(client.account()['balances'][next(i for i, x in enumerate(client.account()['balances']) if x['asset'] == 'USDT')]['free'])
@@ -426,7 +418,6 @@ def webhook():
 
         # --- SELL LOGIC ---
         elif side == 'SELL':
-            # GOD MODE: Force Refresh Balance if CLI
             if is_manual_cli:
                 try:
                     acct = client.account()
@@ -439,7 +430,7 @@ def webhook():
 
             coin_bal = get_cached_balance(base_asset)
             
-            # Safety Net for Automation
+            # Auto-Recovery
             if not is_manual_cli and coin_bal == 0:
                 try:
                     acct = client.account()
@@ -453,7 +444,7 @@ def webhook():
                             break
                 except: pass
 
-            # DEADLOCK FIX
+            # CHECK REALITY
             if coin_bal == 0:
                 if is_manual_cli:
                     raise Exception("Binance Wallet says 0.00 coins.")
@@ -521,10 +512,7 @@ def webhook():
             if 'price' in params: exec_price = float(params['price'])
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Combine incoming reason with any extra info
         final_reason = incoming_reason + extra_log_info
-        
         wallet_now = get_cached_balance("USDT")
         
         row = [ts, symbol, side, f"{req_pct if side=='BUY' else sell_pct}%", sent_price, "", exec_price, exec_qty, status, final_reason, wallet_now]
@@ -534,9 +522,10 @@ def webhook():
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Log error with incoming reason
-        err_msg = f"{incoming_reason} | ERROR: {str(e)}"
-        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, sent_price, "", 0, 0, err_msg, 0, 0]))
+        # VISUAL FIX: Put the Error Message in the REASON column (Pos 10)
+        # Status column (Pos 9) just says "Error"
+        err_msg = f"{incoming_reason} | {str(e)}"
+        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, sent_price, "", 0, 0, "Error", err_msg, 0]))
         return jsonify({"status": "error", "msg": str(e)}), 200
 
 @app.route('/cli', methods=['POST'])
