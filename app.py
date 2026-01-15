@@ -272,7 +272,7 @@ def webhook():
     side = data['side'].upper()
     base_asset = symbol.replace("USDT", "")
     
-    # 2. READ MEMORY & CHECK DOUBLE ALERTS (INSTANT)
+    # 2. READ MEMORY & CHECK DOUBLE ALERTS
     with STATE_LOCK:
         state = get_state(symbol)
         current_status = state['status']
@@ -282,21 +282,20 @@ def webhook():
         f2_type = BOT_SETTINGS['f2_type']
         j2_slip = BOT_SETTINGS['j2_slip']
 
-    # --- BLOCK: DOUBLE ALERT PROTECTION ---
+    # --- DOUBLE ALERT PROTECTION ---
     if side == 'BUY' and current_status == 'HOLDING':
         reason = "Skipped: Already Holding (Memory)"
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, 0, 0, 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, 0, "", 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
         return jsonify({"status": "skipped", "msg": reason})
 
     if side == 'SELL' and current_status == 'EMPTY':
         reason = "Skipped: Already Empty (Memory)"
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, 0, 0, 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, 0, "", 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
         return jsonify({"status": "skipped", "msg": reason})
 
     # 3. SMART BLIND CANCEL
-    # Only cancel if we think we have a limit order pending
     if pending_limit:
         try: client.cancel_open_orders(symbol=symbol)
         except: pass 
@@ -306,12 +305,14 @@ def webhook():
     payload_type = data.get('type', 'MARKET').upper()
     target_type = payload_type
     
-    # Override if Google Settings say LIMIT (unless Manual CLI)
     is_manual_cli = "CLI" in data.get('reason', '')
     if not is_manual_cli and payload_type == 'MARKET' and 'LIMIT' in f2_type:
         if sent_price != 'Market' and safe_float(sent_price) > 0:
             target_type = 'LIMIT'
     
+    # Variable to track if we saved the trade via emergency check
+    extra_log_info = ""
+
     try:
         resp = {}
         status = "Pending"
@@ -321,25 +322,32 @@ def webhook():
             wallet_usdt = get_cached_balance("USDT")
             req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
             
-            # Logic: Use quoteOrderQty (USDT amount)
             amt_usdt = wallet_usdt * (req_pct / 100.0)
-            if req_pct >= 99.9: amt_usdt = wallet_usdt * 0.998 # Buffer for fees
+            if req_pct >= 99.9: amt_usdt = wallet_usdt * 0.998
             
             if amt_usdt < 5:
+                # SAFETY: Force refresh ONCE
+                try: 
+                    fresh_bal = float(client.account()['balances'][next(i for i, x in enumerate(client.account()['balances']) if x['asset'] == 'USDT')]['free'])
+                    with STATE_LOCK: CACHE['wallet']['USDT'] = fresh_bal
+                    amt_usdt = fresh_bal * (req_pct / 100.0)
+                    if req_pct >= 99.9: amt_usdt = fresh_bal * 0.998
+                except: pass
+
+            if amt_usdt < 5:
+                # Return 200 to stop TV retrying
                 raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
 
             params = {"symbol": symbol, "side": "BUY", "type": target_type}
 
             if target_type == 'LIMIT':
-                # For Limit, we need price + coin quantity
                 raw_price = float(data.get('limit_price', sent_price))
-                if raw_price == 0: raw_price = get_coin_price(symbol) # Fallback slow call
+                if raw_price == 0: raw_price = get_coin_price(symbol) 
                 
                 adj_price = raw_price * (1 + (j2_slip / 100.0))
                 tick_size = get_cached_tick(symbol)
                 final_lim = round_step_size(adj_price, tick_size)
                 
-                # Calc Quantity: USDT / Price
                 qty_coins = amt_usdt / final_lim
                 step = get_cached_step(symbol)
                 qty_coins = round_step_size(qty_coins, step)
@@ -348,13 +356,23 @@ def webhook():
                 params['quantity'] = qty_coins
                 params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
             else:
-                # INSTANT MARKET BUY
                 params['quoteOrderQty'] = round(amt_usdt, 2)
 
             resp = client.new_order(**params)
             status = "Filled/Open"
             
-            # MEMORY UPDATE
+            # IMMEDIATE MEMORY UPDATE
+            bought_qty = 0.0
+            spent_usdt = 0.0
+            if 'fills' in resp:
+                for f in resp['fills']:
+                    bought_qty += float(f['qty'])
+                    spent_usdt += float(f['price']) * float(f['qty'])
+                
+                with STATE_LOCK:
+                    CACHE['wallet'][base_asset] = CACHE['wallet'].get(base_asset, 0.0) + bought_qty
+                    CACHE['wallet']['USDT'] = CACHE['wallet'].get('USDT', 0.0) - spent_usdt
+            
             with STATE_LOCK:
                 BOT_STATE[symbol]['status'] = "HOLDING"
                 BOT_STATE[symbol]['pending_limit'] = (target_type == 'LIMIT')
@@ -362,10 +380,24 @@ def webhook():
         # --- SELL LOGIC ---
         elif side == 'SELL':
             coin_bal = get_cached_balance(base_asset)
+            
+            # SAFETY NET: If Cache says 0, force check
             if coin_bal == 0:
-                 raise Exception("Cache says 0 coins")
+                try:
+                    acct = client.account()
+                    for b in acct['balances']:
+                        if b['asset'] == base_asset:
+                            real_bal = float(b['free'])
+                            if real_bal > 0:
+                                coin_bal = real_bal
+                                with STATE_LOCK: CACHE['wallet'][base_asset] = coin_bal
+                                extra_log_info = " [Cache Rec]" # <--- MARKING THE RESCUE
+                            break
+                except: pass
 
-            # Logic: Use Coin Quantity from Cache
+            if coin_bal == 0:
+                 raise Exception("Cache says 0 coins (verified)")
+
             explicit_qty = float(data.get('quantity', 0))
             sell_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
             
@@ -379,7 +411,7 @@ def webhook():
 
             if target_type == 'LIMIT':
                 raw_price = float(data.get('limit_price', sent_price))
-                if raw_price == 0: raw_price = get_coin_price(symbol) # Fallback
+                if raw_price == 0: raw_price = get_coin_price(symbol)
                 
                 adj_price = raw_price * (1 - (j2_slip / 100.0))
                 tick_size = get_cached_tick(symbol)
@@ -389,16 +421,15 @@ def webhook():
                 params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
                 params['timeInForce'] = data.get('timeInForce', 'GTC')
             else:
-                # INSTANT MARKET SELL
                 params['quantity'] = qty
             
             resp = client.new_order(**params)  
             status = "Filled"
 
-            # MEMORY UPDATE
             with STATE_LOCK:
                 BOT_STATE[symbol]['status'] = "EMPTY"
                 BOT_STATE[symbol]['pending_limit'] = (target_type == 'LIMIT')
+                CACHE['wallet'][base_asset] = 0.0
 
         # 5. AGGREGATION & LOGGING
         total_qty = 0.0
@@ -416,23 +447,24 @@ def webhook():
             exec_price = total_quote / total_qty
         else:
             exec_qty = float(resp.get('origQty', 0))
-            # If Limit, use the price we sent
             if 'price' in params: exec_price = float(params['price'])
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        reason = data.get('reason', '')
+        
+        # APPEND EXTRA INFO TO REASON
+        reason = data.get('reason', '') + extra_log_info
+        
         wallet_now = get_cached_balance("USDT")
         
-        row = [ts, symbol, side, f"{req_pct if side=='BUY' else sell_pct}%", sent_price, 0, exec_price, exec_qty, status, reason, wallet_now]
+        row = [ts, symbol, side, f"{req_pct if side=='BUY' else sell_pct}%", sent_price, "", exec_price, exec_qty, status, reason, wallet_now]
         LOG_QUEUE.append(('LOG', row))
         
         return jsonify(resp)
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, 0, 0, 0, 0, str(e), 0, 0]))
-        # Revert state on error if needed? 
-        # Return 200 so TradingView thinks we succeeded and DOES NOT retry
+        # Log error, return 200 OK
+        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, 0, "", 0, 0, str(e), 0, 0]))
         return jsonify({"status": "error", "msg": str(e)}), 200
 
 @app.route('/cli', methods=['POST'])
