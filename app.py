@@ -144,8 +144,8 @@ def background_sync_func():
     tick = 0 
     while True:
         try:
-            # --- TASK A: Sync Settings from Google (Every 10s) ---
-            if tick % 2 == 0: 
+            # --- TASK A: Sync Settings from Google (Every 30s) ---
+            if tick % 6 == 0: 
                 sheet = get_sheet()
                 data = sheet.batch_get(['E2', 'G2', 'K2'])
                 val_e2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 100)
@@ -157,8 +157,8 @@ def background_sync_func():
                     BOT_SETTINGS['f2_type'] = val_f2
                     BOT_SETTINGS['j2_slip'] = val_j2
 
-            # --- TASK B: REALITY CHECK (Every 15s) ---
-            if tick % 1 == 0:
+            # --- TASK B: REALITY CHECK (Every 10s) ---
+            if tick % 2 == 0:
                 try:
                     acct = client.account()
                     with STATE_LOCK:
@@ -198,7 +198,7 @@ def background_sync_func():
                     print(f"Wallet Sync/Heal Error: {e}")
 
             # --- TASK C: Update Dashboard (Visuals) ---
-            if tick % 1 == 0:
+            if tick % 6 == 0:
                 sheet = get_sheet()
                 usdt = CACHE['wallet'].get('USDT', 0)
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
