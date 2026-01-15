@@ -139,7 +139,7 @@ def logger_worker_func():
         time.sleep(1)
 
 def background_sync_func():
-    """Syncs settings, Updates Dashboard, and Refreshes Wallet Cache"""
+    """Syncs settings, Updates Dashboard, Refreshes Wallet, and HEALS STATE"""
     time.sleep(5) 
     tick = 0 
     while True:
@@ -157,16 +157,44 @@ def background_sync_func():
                     BOT_SETTINGS['f2_type'] = val_f2
                     BOT_SETTINGS['j2_slip'] = val_j2
 
-            # --- TASK B: Refresh Wallet Cache (Every 30s) ---
+            # --- TASK B: Refresh Wallet & HEAL STATE (Every 30s) ---
             if tick % 6 == 0:
                 try:
                     acct = client.account()
                     with STATE_LOCK:
-                        # Reset cache slightly to ensure fresh data
+                        # 1. Update Wallet Cache
                         for b in acct['balances']:
-                            CACHE['wallet'][b['asset']] = float(b['free'])
+                            asset = b['asset']
+                            free = float(b['free'])
+                            locked = float(b['locked'])
+                            total = free + locked
+                            
+                            # Update Cache
+                            CACHE['wallet'][asset] = free
+
+                            # 2. HEALER: Logic Check
+                            # If we have coins, force status to HOLDING
+                            if asset != 'USDT' and total > 0:
+                                sym = asset + "USDT"
+                                if sym not in BOT_STATE: BOT_STATE[sym] = {}
+                                # Only update if currently EMPTY to avoid overriding pending logic
+                                if BOT_STATE[sym].get('status') == 'EMPTY':
+                                    print(f"Healer: Found coins for {sym}, correcting to HOLDING")
+                                    BOT_STATE[sym]['status'] = 'HOLDING'
+                                    BOT_STATE[sym]['pending_limit'] = (locked > 0)
+                            
+                            # If we have NO coins, force status to EMPTY
+                            if asset != 'USDT' and total == 0:
+                                sym = asset + "USDT"
+                                if sym in BOT_STATE and BOT_STATE[sym].get('status') == 'HOLDING':
+                                    # If we think we hold it, but we have 0...
+                                    # (Check open orders via pending_limit first to be safe, but total==0 implies no orders locking funds usually)
+                                    print(f"Healer: 0 coins for {sym}, correcting to EMPTY")
+                                    BOT_STATE[sym]['status'] = 'EMPTY'
+                                    BOT_STATE[sym]['pending_limit'] = False
+
                 except Exception as e:
-                    print(f"Wallet Sync Error: {e}")
+                    print(f"Wallet Sync/Heal Error: {e}")
 
             # --- TASK C: Update Dashboard (Visuals) ---
             if tick % 6 == 0:
@@ -175,7 +203,6 @@ def background_sync_func():
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sheet.update('A2:B2', [[ts, usdt]])
                 
-                # Update coin balance on dashboard (H2/I2)
                 h1_val = sheet.acell('I1').value
                 if h1_val:
                     mon_sym = h1_val.replace("USDT","").strip().upper()
@@ -391,12 +418,22 @@ def webhook():
                             if real_bal > 0:
                                 coin_bal = real_bal
                                 with STATE_LOCK: CACHE['wallet'][base_asset] = coin_bal
-                                extra_log_info = " [Cache Rec]" # <--- MARKING THE RESCUE
+                                extra_log_info = " [Cache Rec]"
                             break
                 except: pass
 
+            # --- CRITICAL FIX: DEADLOCK RELEASE ---
             if coin_bal == 0:
-                 raise Exception("Cache says 0 coins (verified)")
+                # Instead of crashing, we fix the state and exit
+                with STATE_LOCK:
+                    BOT_STATE[symbol]['status'] = "EMPTY"
+                    BOT_STATE[symbol]['pending_limit'] = False
+                    CACHE['wallet'][base_asset] = 0.0
+                
+                reason = "Skipped: Wallet 0 (State corrected to EMPTY)" + extra_log_info
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{data.get('PercentAmount', 100)}%", sent_price, "", 0, 0, "Skipped", reason, get_cached_balance("USDT")]))
+                return jsonify({"status": "skipped", "msg": reason})
 
             explicit_qty = float(data.get('quantity', 0))
             sell_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
