@@ -157,12 +157,12 @@ def background_sync_func():
                     BOT_SETTINGS['f2_type'] = val_f2
                     BOT_SETTINGS['j2_slip'] = val_j2
 
-            # --- TASK B: Refresh Wallet & HEAL STATE (Every 30s) ---
-            if tick % 6 == 0:
+            # --- TASK B: REALITY CHECK (Every 15s) ---
+            if tick % 1 == 0:
                 try:
                     acct = client.account()
                     with STATE_LOCK:
-                        # 1. Update Wallet Cache
+                        # 1. Update Wallet Cache (The Truth)
                         for b in acct['balances']:
                             asset = b['asset']
                             free = float(b['free'])
@@ -177,18 +177,19 @@ def background_sync_func():
                             if asset != 'USDT' and total > 0:
                                 sym = asset + "USDT"
                                 if sym not in BOT_STATE: BOT_STATE[sym] = {}
-                                # Only update if currently EMPTY to avoid overriding pending logic
+                                
+                                # If Memory thought we were EMPTY, correct it to HOLDING
                                 if BOT_STATE[sym].get('status') == 'EMPTY':
                                     print(f"Healer: Found coins for {sym}, correcting to HOLDING")
                                     BOT_STATE[sym]['status'] = 'HOLDING'
-                                    BOT_STATE[sym]['pending_limit'] = (locked > 0)
+                                
+                                # If funds are locked, we likely have an Open Order (Limit)
+                                BOT_STATE[sym]['pending_limit'] = (locked > 0)
                             
                             # If we have NO coins, force status to EMPTY
                             if asset != 'USDT' and total == 0:
                                 sym = asset + "USDT"
                                 if sym in BOT_STATE and BOT_STATE[sym].get('status') == 'HOLDING':
-                                    # If we think we hold it, but we have 0...
-                                    # (Check open orders via pending_limit first to be safe, but total==0 implies no orders locking funds usually)
                                     print(f"Healer: 0 coins for {sym}, correcting to EMPTY")
                                     BOT_STATE[sym]['status'] = 'EMPTY'
                                     BOT_STATE[sym]['pending_limit'] = False
@@ -197,7 +198,7 @@ def background_sync_func():
                     print(f"Wallet Sync/Heal Error: {e}")
 
             # --- TASK C: Update Dashboard (Visuals) ---
-            if tick % 6 == 0:
+            if tick % 1 == 0:
                 sheet = get_sheet()
                 usdt = CACHE['wallet'].get('USDT', 0)
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
