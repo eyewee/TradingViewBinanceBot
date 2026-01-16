@@ -140,78 +140,88 @@ def logger_worker_func():
 
 def background_sync_func():
     """Syncs settings, Updates Dashboard, Refreshes Wallet, and HEALS STATE"""
+    # Create a PRIVATE client for this thread to avoid SSL race conditions
+    sync_client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
+    
     time.sleep(5) 
     tick = 0 
     while True:
         try:
-            # --- TASK A: Sync Settings from Google (Every 30s) ---
-            if tick % 6 == 0: 
-                sheet = get_sheet()
-                data = sheet.batch_get(['E2', 'G2', 'K2'])
-                val_e2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 100)
-                val_f2 = str(data[1][0][0]).upper() if (len(data) > 1 and data[1]) else "MARKET"
-                val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data) > 2 and data[2]) else 0)
-                
-                with STATE_LOCK:
-                    BOT_SETTINGS['e2_pct'] = val_e2
-                    BOT_SETTINGS['f2_type'] = val_f2
-                    BOT_SETTINGS['j2_slip'] = val_j2
+            # OPTIMIZATION: Initialize sheet only if needed
+            sheet = None
+            needs_google = (tick % 3 == 0) or (tick % 6 == 0)
+            
+            if needs_google:
+                try: sheet = get_sheet()
+                except Exception as e: print(f"Google Connect Error: {e}")
 
-            # --- TASK B: REALITY CHECK (Every 10s) ---
+            # --- TASK A: Sync Settings from Google (Every 15s) ---
+            if tick % 3 == 0 and sheet: 
+                try:
+                    data = sheet.batch_get(['E2', 'G2', 'K2'])
+                    val_e2 = safe_float(data[0][0][0] if (len(data) > 0 and data[0]) else 100)
+                    val_f2 = str(data[1][0][0]).upper() if (len(data) > 1 and data[1]) else "MARKET"
+                    val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data) > 2 and data[2]) else 0)
+                    
+                    with STATE_LOCK:
+                        BOT_SETTINGS['e2_pct'] = val_e2
+                        BOT_SETTINGS['f2_type'] = val_f2
+                        BOT_SETTINGS['j2_slip'] = val_j2
+                except Exception as e: print(f"Settings Sync Error: {e}")
+
+            # --- TASK B: REALITY CHECK (Binance Only - Every 15s) ---
             if tick % 2 == 0:
                 try:
-                    acct = client.account()
+                    # USE THE PRIVATE CLIENT HERE (sync_client)
+                    acct = sync_client.account() 
+                    
                     with STATE_LOCK:
-                        # 1. Update Wallet Cache (The Truth)
+                        # 1. Update Wallet Cache
                         for b in acct['balances']:
                             asset = b['asset']
                             free = float(b['free'])
                             locked = float(b['locked'])
                             total = free + locked
                             
-                            # Update Cache
                             CACHE['wallet'][asset] = free
 
                             # 2. HEALER: Logic Check
-                            # If we have coins, force status to HOLDING
                             if asset != 'USDT' and total > 0:
                                 sym = asset + "USDT"
                                 if sym not in BOT_STATE: BOT_STATE[sym] = {}
-                                
-                                # If Memory thought we were EMPTY, correct it to HOLDING
                                 if BOT_STATE[sym].get('status') == 'EMPTY':
                                     print(f"Healer: Found coins for {sym}, correcting to HOLDING")
                                     BOT_STATE[sym]['status'] = 'HOLDING'
-                                
-                                # If funds are locked, we likely have an Open Order (Limit)
                                 BOT_STATE[sym]['pending_limit'] = (locked > 0)
                             
-                            # If we have NO coins, force status to EMPTY
                             if asset != 'USDT' and total == 0:
                                 sym = asset + "USDT"
                                 if sym in BOT_STATE and BOT_STATE[sym].get('status') == 'HOLDING':
                                     print(f"Healer: 0 coins for {sym}, correcting to EMPTY")
                                     BOT_STATE[sym]['status'] = 'EMPTY'
                                     BOT_STATE[sym]['pending_limit'] = False
-
                 except Exception as e:
+                    # If the private client crashes, re-initialize it for next loop
                     print(f"Wallet Sync/Heal Error: {e}")
+                    try: sync_client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
+                    except: pass
 
-            # --- TASK C: Update Dashboard (Visuals) ---
-            if tick % 6 == 0:
-                sheet = get_sheet()
-                usdt = CACHE['wallet'].get('USDT', 0)
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                sheet.update('A2:B2', [[ts, usdt]])
-                
-                h1_val = sheet.acell('I1').value
-                if h1_val:
-                    mon_sym = h1_val.replace("USDT","").strip().upper()
-                    c_bal = CACHE['wallet'].get(mon_sym, 0.0)
-                    sheet.update('I2', [[c_bal]])
+            # --- TASK C: Update Dashboard (Visuals - Every 30s) ---
+            if tick % 6 == 0 and sheet:
+                try:
+                    usdt = CACHE['wallet'].get('USDT', 0)
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    sheet.update('A2:B2', [[ts, usdt]])
+                    
+                    h1_val = sheet.acell('I1').value
+                    if h1_val:
+                        mon_sym = h1_val.replace("USDT","").strip().upper()
+                        c_bal = CACHE['wallet'].get(mon_sym, 0.0)
+                        sheet.update('I2', [[c_bal]])
+                except Exception as e: print(f"Dashboard Update Error: {e}")
 
         except Exception as e:
-            print(f"Sync Error: {e}")
+            print(f"Loop Error: {e}")
             time.sleep(10)
         
         tick += 1
