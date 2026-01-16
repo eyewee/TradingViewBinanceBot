@@ -536,6 +536,249 @@ def webhook():
         # Status column (Pos 9) just says "Error"
         err_msg = f"{incoming_reason} | {str(e)}"
         LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, sent_price, "", 0, 0, "Error", err_msg, 0]))
+        return jsonify({"status": "error", "msg": str(e)}), 200@app.route('/webhook', methods=['POST'])
+def webhook():
+    ensure_threads_running()
+    
+    data = request.get_json(force=True)
+    if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
+    
+    # 1. PARSE EVERYTHING FIRST
+    raw_s = data['symbol'].upper().replace("/", "")
+    symbol = raw_s + "T" if raw_s.endswith("USD") and not raw_s.endswith("USDT") else raw_s
+    side = data['side'].upper()
+    base_asset = symbol.replace("USDT", "")
+    
+    sent_price = data.get('price', 'Market')
+    payload_type = data.get('type', 'MARKET').upper()
+    target_type = payload_type
+    
+    incoming_reason = data.get('reason', '')
+    is_manual_cli = "CLI" in incoming_reason
+
+    # Settings Override
+    if not is_manual_cli:
+        with STATE_LOCK:
+            f2_type = BOT_SETTINGS['f2_type']
+            e2_pct = BOT_SETTINGS['e2_pct']
+            j2_slip = BOT_SETTINGS['j2_slip']
+            
+        if payload_type == 'MARKET' and 'LIMIT' in f2_type:
+             if sent_price != 'Market' and safe_float(sent_price) > 0:
+                target_type = 'LIMIT'
+    else:
+        e2_pct = 100.0
+        j2_slip = 0.0
+
+    # 2. READ MEMORY
+    with STATE_LOCK:
+        state = get_state(symbol)
+        current_status = state['status']
+        pending_limit = state['pending_limit']
+
+    # --- BLOCK: DOUBLE ALERT PROTECTION ---
+    if not is_manual_cli:
+        if side == 'BUY' and current_status == 'HOLDING':
+            skip_msg = f"{incoming_reason} | Skipped: Already Holding (Memory)"
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            LOG_QUEUE.append(('LOG', [ts, symbol, side, 0, sent_price, "", 0, 0, "Skipped", skip_msg, get_cached_balance("USDT")]))
+            return jsonify({"status": "skipped", "msg": skip_msg})
+
+        # SELL protection removed intentionally to prevent deadlocks
+
+    # 3. SMART BLIND CANCEL
+    if is_manual_cli or pending_limit:
+        try: client.cancel_open_orders(symbol=symbol)
+        except: pass 
+
+    # 4. EXECUTION
+    extra_log_info = ""
+    try:
+        resp = {}
+        status = "Pending"
+        
+        # --- BUY LOGIC ---
+        if side == 'BUY':
+            if is_manual_cli:
+                try: 
+                    fresh_bal = float(client.account()['balances'][next(i for i, x in enumerate(client.account()['balances']) if x['asset'] == 'USDT')]['free'])
+                    with STATE_LOCK: CACHE['wallet']['USDT'] = fresh_bal
+                except: pass
+
+            wallet_usdt = get_cached_balance("USDT")
+            req_pct = float(data.get('PercentAmount', data.get('percentage', e2_pct)))
+            
+            amt_usdt = wallet_usdt * (req_pct / 100.0)
+            if req_pct >= 99.9: amt_usdt = wallet_usdt * 0.998
+            
+            # Auto-Recovery
+            if not is_manual_cli and amt_usdt < 5:
+                try: 
+                    fresh_bal = float(client.account()['balances'][next(i for i, x in enumerate(client.account()['balances']) if x['asset'] == 'USDT')]['free'])
+                    with STATE_LOCK: CACHE['wallet']['USDT'] = fresh_bal
+                    amt_usdt = fresh_bal * (req_pct / 100.0)
+                    if req_pct >= 99.9: amt_usdt = fresh_bal * 0.998
+                except: pass
+
+            if amt_usdt < 5:
+                raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
+
+            params = {"symbol": symbol, "side": "BUY", "type": target_type}
+
+            if target_type == 'LIMIT':
+                raw_price = float(data.get('limit_price', sent_price))
+                if raw_price == 0: raw_price = get_coin_price(symbol) 
+                
+                adj_price = raw_price * (1 + (j2_slip / 100.0))
+                tick_size = get_cached_tick(symbol)
+                final_lim = round_step_size(adj_price, tick_size)
+                
+                qty_coins = amt_usdt / final_lim
+                step = get_cached_step(symbol)
+                qty_coins = round_step_size(qty_coins, step)
+                
+                params['timeInForce'] = data.get('timeInForce', 'GTC')
+                params['quantity'] = qty_coins
+                params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
+            else:
+                params['quoteOrderQty'] = round(amt_usdt, 2)
+
+            resp = client.new_order(**params)
+            status = "Filled/Open"
+            
+            # MEMORY UPDATE
+            bought_qty = 0.0
+            spent_usdt = 0.0
+            if 'fills' in resp:
+                for f in resp['fills']:
+                    bought_qty += float(f['qty'])
+                    spent_usdt += float(f['price']) * float(f['qty'])
+                
+                with STATE_LOCK:
+                    CACHE['wallet'][base_asset] = CACHE['wallet'].get(base_asset, 0.0) + bought_qty
+                    CACHE['wallet']['USDT'] = CACHE['wallet'].get('USDT', 0.0) - spent_usdt
+            
+            with STATE_LOCK:
+                BOT_STATE[symbol]['status'] = "HOLDING"
+                BOT_STATE[symbol]['pending_limit'] = (target_type == 'LIMIT')
+
+        # --- SELL LOGIC ---
+        elif side == 'SELL':
+            if is_manual_cli:
+                try:
+                    acct = client.account()
+                    for b in acct['balances']:
+                        if b['asset'] == base_asset:
+                            real_bal = float(b['free'])
+                            with STATE_LOCK: CACHE['wallet'][base_asset] = real_bal
+                            break
+                except: pass
+
+            coin_bal = get_cached_balance(base_asset)
+            
+            # Auto-Recovery
+            if not is_manual_cli and coin_bal == 0:
+                try:
+                    acct = client.account()
+                    for b in acct['balances']:
+                        if b['asset'] == base_asset:
+                            real_bal = float(b['free'])
+                            if real_bal > 0:
+                                coin_bal = real_bal
+                                with STATE_LOCK: CACHE['wallet'][base_asset] = coin_bal
+                                extra_log_info = " [Cache Rec]"
+                            break
+                except: pass
+
+            # CHECK REALITY
+            if coin_bal == 0:
+                if is_manual_cli:
+                    raise Exception("Binance Wallet says 0.00 coins.")
+                
+                # Release Deadlock
+                with STATE_LOCK:
+                    BOT_STATE[symbol]['status'] = "EMPTY"
+                    BOT_STATE[symbol]['pending_limit'] = False
+                    CACHE['wallet'][base_asset] = 0.0
+                
+                skip_msg = f"{incoming_reason} | Skipped: Wallet 0 (State corrected to EMPTY){extra_log_info}"
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{data.get('PercentAmount', 100)}%", sent_price, "", 0, 0, "Skipped", skip_msg, get_cached_balance("USDT")]))
+                return jsonify({"status": "skipped", "msg": skip_msg})
+
+            explicit_qty = float(data.get('quantity', 0))
+            sell_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
+            
+            if explicit_qty > 0: qty = explicit_qty
+            else: qty = coin_bal * (sell_pct / 100.0)
+
+            step = get_cached_step(symbol)
+            qty = round_step_size(qty, step) 
+            
+            params = {"symbol": symbol, "side": "SELL", "type": target_type}
+
+            if target_type == 'LIMIT':
+                raw_price = float(data.get('limit_price', sent_price))
+                if raw_price == 0: raw_price = get_coin_price(symbol)
+                
+                adj_price = raw_price * (1 - (j2_slip / 100.0))
+                tick_size = get_cached_tick(symbol)
+                final_lim = round_step_size(adj_price, tick_size)
+                
+                params['quantity'] = qty
+                params['price'] = "{:.8f}".format(final_lim).rstrip('0').rstrip('.')
+                params['timeInForce'] = data.get('timeInForce', 'GTC')
+            else:
+                params['quantity'] = qty
+            
+            resp = client.new_order(**params)  
+            status = "Filled"
+
+            # --- CRITICAL FIX START: Calculate Gains and Update USDT Cache ---
+            gained_usdt = 0.0
+            if 'fills' in resp:
+                for f in resp['fills']:
+                    gained_usdt += float(f['price']) * float(f['qty'])
+            
+            with STATE_LOCK:
+                BOT_STATE[symbol]['status'] = "EMPTY"
+                BOT_STATE[symbol]['pending_limit'] = (target_type == 'LIMIT')
+                CACHE['wallet'][base_asset] = 0.0
+                # ADD THE GAINS BACK TO WALLET IMMEDIATELY
+                CACHE['wallet']['USDT'] = CACHE['wallet'].get('USDT', 0.0) + gained_usdt
+            # --- CRITICAL FIX END ---
+
+        # 5. LOGGING
+        total_qty = 0.0
+        total_quote = 0.0
+        exec_price = 0.0
+        exec_qty = 0.0
+        
+        if 'fills' in resp:
+            for f in resp['fills']:
+                total_qty += float(f['qty'])
+                total_quote += float(f['price']) * float(f['qty'])
+        
+        if total_qty > 0:
+            exec_qty = total_qty
+            exec_price = total_quote / total_qty
+        else:
+            exec_qty = float(resp.get('origQty', 0))
+            if 'price' in params: exec_price = float(params['price'])
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        final_reason = incoming_reason + extra_log_info
+        wallet_now = get_cached_balance("USDT")
+        
+        row = [ts, symbol, side, f"{req_pct if side=='BUY' else sell_pct}%", sent_price, "", exec_price, exec_qty, status, final_reason, wallet_now]
+        LOG_QUEUE.append(('LOG', row))
+        
+        return jsonify(resp)
+
+    except Exception as e:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        err_msg = f"{incoming_reason} | {str(e)}"
+        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, sent_price, "", 0, 0, "Error", err_msg, 0]))
         return jsonify({"status": "error", "msg": str(e)}), 200
 
 @app.route('/cli', methods=['POST'])
