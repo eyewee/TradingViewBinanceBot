@@ -288,6 +288,25 @@ if __name__ == "__main__":
         print("Fetching Raw Server Memory...")
         res = send_request("/cli", {"method": "debug_memory"})
         print(json.dumps(res, indent=2))
+        
+    # 7. PANIC BUTTON
+    elif cmd == "panic":
+        if len(args) < 2: print("Usage: panic SYMBOL"); sys.exit()
+        symbol = args[2].upper()
+        print(f"!!! INITIATING PANIC SELL FOR {symbol} !!!")
+        print("1. Cancelling Orders...")
+        print("2. Waiting for unlock...")
+        print("3. Selling ALL assets...")
+        
+        res = send_request("/panic", {"symbol": symbol})
+        
+        if res:
+            print("\n--- PANIC REPORT ---")
+            for line in res.get('log', []):
+                print(f"> {line}")
+            print(f"Final Status: {res.get('status')}")
+            if 'order' in res:
+                format_execution(res['order'])    
 
     else:
         # MAP SHORTCUTS TO REAL BINANCE METHODS

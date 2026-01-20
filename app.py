@@ -139,7 +139,7 @@ def logger_worker_func():
         time.sleep(1)
 
 def background_sync_func():
-    """Syncs settings, Updates Dashboard, Refreshes Wallet, and HEALS STATE"""
+    """Syncs settings, Updates Dashboard, and FORCES Wallet Sync"""
     # Create a PRIVATE client for this thread to avoid SSL race conditions
     sync_client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
     
@@ -155,7 +155,7 @@ def background_sync_func():
                 try: sheet = get_sheet()
                 except Exception as e: print(f"Google Connect Error: {e}")
 
-            # --- TASK A: Sync Settings from Google (Every 15s) ---
+            # --- TASK A: Sync Settings (Every 15s) ---
             if tick % 3 == 0 and sheet: 
                 try:
                     data = sheet.batch_get(['E2', 'G2', 'K2'])
@@ -169,44 +169,52 @@ def background_sync_func():
                         BOT_SETTINGS['j2_slip'] = val_j2
                 except Exception as e: print(f"Settings Sync Error: {e}")
 
-            # --- TASK B: REALITY CHECK (Binance Only - Every 15s) ---
+            # --- TASK B: HARD WALLET SYNC (Every 10s) ---
             if tick % 2 == 0:
                 try:
-                    # USE THE PRIVATE CLIENT HERE (sync_client)
+                    # DIRECT EXCHANGE CALL - NO GUESSING
                     acct = sync_client.account() 
                     
                     with STATE_LOCK:
-                        # 1. Update Wallet Cache
+                        # Reset/Update Cache based on absolute reality
                         for b in acct['balances']:
                             asset = b['asset']
                             free = float(b['free'])
                             locked = float(b['locked'])
                             total = free + locked
                             
+                            # Update RAM
                             CACHE['wallet'][asset] = free
 
-                            # 2. HEALER: Logic Check
-                            if asset != 'USDT' and total > 0:
+                            # FORCE STATE UPDATE
+                            # If we have coins (free or locked), we are HOLDING
+                            if asset != 'USDT':
                                 sym = asset + "USDT"
-                                if sym not in BOT_STATE: BOT_STATE[sym] = {}
-                                if BOT_STATE[sym].get('status') == 'EMPTY':
-                                    print(f"Healer: Found coins for {sym}, correcting to HOLDING")
+                                if total > 0:
+                                    # If not already tracked, track it
+                                    if sym not in BOT_STATE: BOT_STATE[sym] = {}
+                                    
+                                    # Update status
                                     BOT_STATE[sym]['status'] = 'HOLDING'
-                                BOT_STATE[sym]['pending_limit'] = (locked > 0)
-                            
-                            if asset != 'USDT' and total == 0:
-                                sym = asset + "USDT"
-                                if sym in BOT_STATE and BOT_STATE[sym].get('status') == 'HOLDING':
-                                    print(f"Healer: 0 coins for {sym}, correcting to EMPTY")
-                                    BOT_STATE[sym]['status'] = 'EMPTY'
-                                    BOT_STATE[sym]['pending_limit'] = False
+                                    
+                                    # If coins are locked, we have a pending SELL limit
+                                    # If coins are free but we are HOLDING, no pending sell
+                                    BOT_STATE[sym]['pending_limit'] = (locked > 0)
+                                else:
+                                    # Total is 0
+                                    if sym in BOT_STATE:
+                                        BOT_STATE[sym]['status'] = 'EMPTY'
+                                        # But wait... do we have locked USDT?
+                                        # We can't easily map locked USDT to a specific pair here without
+                                        # checking open orders, but we assume EMPTY if 0 coins.
+                                        BOT_STATE[sym]['pending_limit'] = False
+
                 except Exception as e:
-                    # If the private client crashes, re-initialize it for next loop
-                    print(f"Wallet Sync/Heal Error: {e}")
+                    print(f"Wallet Sync Error: {e}")
                     try: sync_client = Spot(api_key=API_KEY, api_secret=API_SECRET, base_url=BASE_URL)
                     except: pass
 
-            # --- TASK C: Update Dashboard (Visuals - Every 30s) ---
+            # --- TASK C: Update Dashboard (Every 30s) ---
             if tick % 6 == 0 and sheet:
                 try:
                     usdt = CACHE['wallet'].get('USDT', 0)
@@ -346,9 +354,14 @@ def webhook():
             return jsonify({"status": "skipped", "msg": skip_msg})
 
     # 3. SMART BLIND CANCEL
+    # Only cancel if CLI requested OR we know we have a pending limit
     if is_manual_cli or pending_limit:
-        try: client.cancel_open_orders(symbol=symbol)
-        except: pass 
+        try: 
+            # just try to cancel to ensure clean slate.
+            client.cancel_open_orders(symbol=symbol)
+            # Short sleep to allow Binance backend to unlock funds
+            time.sleep(0.5)
+        except: pass
 
     # 4. EXECUTION
     extra_log_info = ""
@@ -534,6 +547,46 @@ def webhook():
         err_msg = f"{incoming_reason} | {str(e)}"
         LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, sent_price, "", 0, 0, "Error", err_msg, 0]))
         return jsonify({"status": "error", "msg": str(e)}), 200
+
+@app.route('/panic', methods=['POST'])
+def panic():
+    ensure_threads_running()
+    data = request.json
+    if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
+    
+    symbol = data.get('symbol', '').upper()
+    if not symbol: return jsonify({"error": "Symbol required"}), 400
+    
+    base_asset = symbol.replace("USDT", "")
+    log = []
+
+    try:
+        # 1. CANCEL EVERYTHING
+        try:
+            client.cancel_open_orders(symbol=symbol)
+            log.append("Orders Cancelled.")
+        except Exception as e:
+            log.append(f"Cancel failed (maybe none open): {e}")
+
+        # 2. WAIT FOR UNLOCK
+        time.sleep(1)
+
+        # 3. GET REAL BALANCE (Bypass Cache)
+        acct = client.account()
+        free_bal = 0.0
+        for b in acct['balances']:
+            if b['asset'] == base_asset:
+                free_bal = float(b['free'])
+                break
+        
+        log.append(f"Free Balance: {free_bal}")
+
+        # 4. MARKET SELL EVERYTHING
+        response = "Nothing to sell."
+        if free_bal > 0:
+            # Rounding
+            step = get_cached_step(symbol)
+            qty = round_step_
 
 @app.route('/cli', methods=['POST'])
 def cli():
