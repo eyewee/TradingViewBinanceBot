@@ -559,6 +559,7 @@ def panic():
     
     base_asset = symbol.replace("USDT", "")
     log = []
+    response = "Nothing to sell"
 
     try:
         # 1. CANCEL EVERYTHING
@@ -582,11 +583,38 @@ def panic():
         log.append(f"Free Balance: {free_bal}")
 
         # 4. MARKET SELL EVERYTHING
-        response = "Nothing to sell."
         if free_bal > 0:
             # Rounding
             step = get_cached_step(symbol)
-            qty = round_step_
+            qty = round_step_size(free_bal, step)
+            
+            log.append(f"Attempting to sell {qty}...")
+            
+            # Execute Sell
+            try:
+                res = client.new_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty)
+                log.append("SELL EXECUTED.")
+                response = res
+                
+                # FORCE STATE UPDATE
+                with STATE_LOCK:
+                    BOT_STATE[symbol]['status'] = 'EMPTY'
+                    BOT_STATE[symbol]['pending_limit'] = False
+                    CACHE['wallet'][base_asset] = 0.0
+            except Exception as e:
+                log.append(f"Sell Failed: {e}")
+        else:
+            log.append("Balance is 0. No sell action taken.")
+            
+            # Ensure state is clean even if we didn't sell
+            with STATE_LOCK:
+                BOT_STATE[symbol]['status'] = 'EMPTY'
+                BOT_STATE[symbol]['pending_limit'] = False
+
+    except Exception as e:
+        log.append(f"Panic Critical Error: {str(e)}")
+
+    return jsonify({"log": log, "status": "Done", "order": response})
 
 @app.route('/cli', methods=['POST'])
 def cli():
