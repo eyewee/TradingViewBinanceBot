@@ -72,9 +72,20 @@ def smart_trade(side, symbol, amt):
         elif amt.lower() == "all": payload["PercentAmount"] = 100.0
         else: print("Use % or $ for buys"); return
     elif side == "SELL":
-        if "%" in amt: payload["PercentAmount"] = float(amt.replace("%", ""))
-        elif amt.lower() == "all": payload["PercentAmount"] = 100.0
-        else: payload["quantity"] = float(amt)
+        if "%" in amt: 
+            payload["PercentAmount"] = float(amt.replace("%", ""))
+        elif "$" in amt:
+            # Convert USD amount to coin quantity using current price
+            p_res = send_request("/cli", {"method": "ticker_price", "params": {"symbol": symbol}})
+            price = float(p_res.get('price', 0) if p_res else 0)
+            if price > 0:
+                payload["quantity"] = float(amt.replace("$", "")) / price
+            else:
+                print("Error: Could not fetch price for conversion."); return
+        elif amt.lower() == "all": 
+            payload["PercentAmount"] = 100.0
+        else: 
+            payload["quantity"] = float(amt)
 
     format_execution(send_request("/webhook", payload))
 
