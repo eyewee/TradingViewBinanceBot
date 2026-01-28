@@ -67,6 +67,10 @@ def safe_float(value, default=0.0):
         return float(value)
     except: return default
 
+def get_cached_balance(asset):
+    with STATE_LOCK:
+        return CACHE['wallet'].get(asset, 0.0)
+
 def get_sheet():
     global GOOGLE_CLIENT
     try:
