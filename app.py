@@ -308,6 +308,10 @@ def webhook():
             
             if bal == 0:
                 with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
+                # --- LOG THE SKIP ---
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", "Wallet 0", CACHE['wallet'].get('USDT', 0)]))
+                # --------------------
                 return jsonify({"status": "skipped", "msg": "Wallet 0"})
 
             pct = float(data.get('PercentAmount', data.get('percentage', 100)))
