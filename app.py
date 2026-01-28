@@ -167,7 +167,7 @@ def background_sync_func():
                 try:
                     usdt = CACHE['wallet'].get('USDT', 0)
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sheet.update('A2:B2', [[ts, f"{usdt} | {CURRENT_EXCHANGE_NAME}"]])
+                    sheet.update('A2:B2', [[ts, usdt]])
                     ms = BOT_SETTINGS.get('active_symbol', '').replace("USDT","").replace("/","").strip()
                     if ms: sheet.update('I2', [[CACHE['wallet'].get(ms, 0.0)]])
                 except: pass

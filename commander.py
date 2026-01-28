@@ -104,7 +104,8 @@ if __name__ == "__main__":
         format_execution(send_request("/webhook", p))
 
     elif cmd == "balance":
-        t = args[2].upper().replace("USDT","")
+        t = args[2].upper()
+        if t != "USDT": t = t.replace("USDT", "")
         res = send_request("/cli", {"method": "account"})
         found = False
         for b in res.get('balances', []):
