@@ -340,7 +340,18 @@ def webhook():
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        LOG_QUEUE.append(('LOG', [ts, symbol, "ERROR", 0, 0, "", 0, 0, "Error", str(e), 0]))
+        
+        # --- IMPROVED ERROR LOGGING ---
+        # Combine the incoming reason (from TV) with the actual error
+        full_reason = f"{reason} | {str(e)}"
+        
+        # Get the intended percentage
+        pct = f"{data.get('PercentAmount', data.get('percentage', 0))}%"
+        
+        # Log: [Time, Symbol, SIDE, Pct, SignalPrice, "", 0, 0, "Error", FullReason, Wallet]
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, pct, price, "", 0, 0, "Error", full_reason, CACHE['wallet'].get('USDT', 0)]))
+        # ------------------------------
+        
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
 @app.route('/panic', methods=['POST'])
