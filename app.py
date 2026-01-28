@@ -173,7 +173,7 @@ def background_sync_func():
                 except: pass
         except: time.sleep(10)
         tick += 1
-        time.sleep(5)
+        time.sleep(3)
 
 def ensure_threads_running():
     if THREADS["logger"] is None or not THREADS["logger"].is_alive():
@@ -248,6 +248,7 @@ def webhook():
     is_cli = "CLI" in reason
 
     with STATE_LOCK:
+        # Settings Override
         if not is_cli:
             e2 = BOT_SETTINGS['e2_pct']
             slip = BOT_SETTINGS['j2_slip']
@@ -256,12 +257,11 @@ def webhook():
         else:
             e2, slip = 100.0, 0.0
         
+        # State Check
         st = get_state(symbol)
         if not is_cli and side == 'buy' and st['status'] == 'HOLDING':
-            # --- LOG THE SKIP ---
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", "Already Holding", CACHE['wallet'].get('USDT', 0)]))
-            # --------------------
             return jsonify({"status": "skipped", "msg": "Already Holding"})
         
         if is_cli or st['pending_limit']:
@@ -270,6 +270,7 @@ def webhook():
             time.sleep(0.5)
 
     try:
+        # Auto-Refresh Balance for CLI to ensure accuracy
         if is_cli:
             try:
                 fresh = EXCHANGE_INSTANCE.fetch_balance()
@@ -279,79 +280,138 @@ def webhook():
             except: pass
 
         resp = {}
+        log_retry = ""
+
+        # ==========================
+        #       BUY LOGIC
+        # ==========================
         if side == 'buy':
-            w_usdt = CACHE['wallet'].get('USDT', 0.0)
-            pct = float(data.get('PercentAmount', data.get('percentage', e2)))
-            amt = w_usdt * (pct / 100.0)
-            if pct >= 99.9: amt *= 0.998
-            if amt < 5: raise Exception(f"Insufficient USDT: {amt:.2f}")
-
-            p_val = safe_float(price)
-            if p_val == 0: p_val = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
-            qty = amt / p_val
-
-            if otype == 'limit':
-                lim_p = float(data.get('limit_price', price))
-                if lim_p == 0: lim_p = p_val
-                lim_p *= (1 + (slip / 100.0))
-                resp = EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
-                with STATE_LOCK: BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': True})
-            else:
-                resp = EXCHANGE_INSTANCE.create_order(symbol, 'market', 'buy', qty)
-                with STATE_LOCK: BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': False})
-
-        elif side == 'sell':
-            bal = CACHE['wallet'].get(base, 0.0)
-            if bal == 0 and not is_cli:
-                 f = EXCHANGE_INSTANCE.fetch_balance()
-                 bal = f['free'].get(base, 0.0)
+            wallet_usdt = get_cached_balance("USDT")
+            req_pct = float(data.get('PercentAmount', data.get('percentage', e2)))
             
-            if bal == 0:
+            # Safety buffer: 99.8% to allow for fees/rounding
+            amt_usdt = wallet_usdt * (0.998 if req_pct >= 99.0 else req_pct / 100.0)
+            if amt_usdt < 5: raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
+
+            # Define execution function to allow retry
+            def execute_buy(usdt_amount):
+                if otype == 'limit':
+                    # 1. Calculate Limit Price
+                    cur_p = safe_float(price)
+                    if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
+                    
+                    lim_p = float(data.get('limit_price', cur_p))
+                    if lim_p == 0: lim_p = cur_p
+                    lim_p *= (1 + (slip / 100.0))
+                    
+                    # 2. CRITICAL: Calc Qty using LIMIT Price (not current)
+                    # This ensures Qty * LimitPrice <= WalletBalance
+                    qty = usdt_amount / lim_p
+                    
+                    return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
+                else:
+                    # 3. Intelligent Market Buy (Send USDT directly)
+                    return EXCHANGE_INSTANCE.create_market_buy_order_with_cost(symbol, usdt_amount)
+
+            try:
+                # Attempt 1: Fast (Cached Balance)
+                resp = execute_buy(amt_usdt)
+            except ccxt.InsufficientFunds:
+                # Attempt 2: Failover (Fresh Balance)
+                log_retry = " | Retry: Funds"
+                fresh = EXCHANGE_INSTANCE.fetch_balance()
+                with STATE_LOCK: CACHE['wallet']['USDT'] = fresh['free'].get('USDT', 0.0)
+                
+                # Recalculate Amount
+                amt_usdt = fresh['free'].get('USDT', 0.0) * (0.998 if req_pct >= 99.0 else req_pct / 100.0)
+                resp = execute_buy(amt_usdt)
+
+            with STATE_LOCK:
+                BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': (otype == 'limit')})
+
+        # ==========================
+        #       SELL LOGIC
+        # ==========================
+        elif side == 'sell':
+            # 1. Get Balance
+            coin_bal = get_cached_balance(base)
+            
+            # Double check if 0
+            if coin_bal == 0 and not is_cli:
+                 f = EXCHANGE_INSTANCE.fetch_balance()
+                 coin_bal = f['free'].get(base, 0.0)
+            
+            if coin_bal == 0:
                 with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
-                # --- LOG THE SKIP ---
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", "Wallet 0", CACHE['wallet'].get('USDT', 0)]))
-                # --------------------
                 return jsonify({"status": "skipped", "msg": "Wallet 0"})
 
-            pct = float(data.get('PercentAmount', data.get('percentage', 100)))
+            req_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
             qty = float(data.get('quantity', 0))
-            if qty == 0: qty = bal * (pct / 100.0)
+            if qty == 0: qty = coin_bal * (req_pct / 100.0)
 
-            if otype == 'limit':
-                lim_p = float(data.get('limit_price', price))
-                if lim_p == 0: lim_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
-                lim_p *= (1 - (slip / 100.0))
-                resp = EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
-                with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': True})
-            else:
-                resp = EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', qty)
-                with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
+            def execute_sell(q):
+                if otype == 'limit':
+                    # Calculate Limit Price
+                    cur_p = safe_float(price)
+                    if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
+                    
+                    lim_p = float(data.get('limit_price', cur_p))
+                    if lim_p == 0: lim_p = cur_p
+                    lim_p *= (1 - (slip / 100.0))
+                    
+                    return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', q, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
+                else:
+                    return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', q)
 
+            try:
+                # Attempt 1
+                resp = execute_sell(qty)
+            except ccxt.InsufficientFunds:
+                # Attempt 2: Drift Correction
+                log_retry = " | Retry: Drift"
+                fresh = EXCHANGE_INSTANCE.fetch_balance()
+                real_qty = fresh['free'].get(base, 0.0)
+                
+                # Update Cache
+                with STATE_LOCK: CACHE['wallet'][base] = real_qty
+                
+                # If we were trying to sell 100%, use the full real balance
+                if req_pct >= 99.9: qty = real_qty
+                else: qty = real_qty * (req_pct / 100.0)
+                
+                resp = execute_sell(qty)
+
+            with STATE_LOCK: 
+                BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': (otype == 'limit')})
+
+        # ==========================
+        #       LOGGING
+        # ==========================
         mapped = {
             "symbol": resp.get('symbol'), "side": resp.get('side'), "type": resp.get('type'),
             "status": resp.get('status'), "executedQty": resp.get('filled', 0),
             "cummulativeQuoteQty": resp.get('cost', 0), "price": resp.get('average', resp.get('price', 0))
         }
         
+        # Immediate Post-Trade Refresh (Optional but recommended for speed)
+        # We spawn a thread to do this so we don't delay the webhook response
+        threading.Thread(target=lambda: background_sync_func(), daemon=True).start()
+
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{data.get('PercentAmount')}%", price, "", mapped['price'], mapped['executedQty'], mapped['status'], reason, CACHE['wallet'].get('USDT')]))
+        log_pct = data.get('PercentAmount', data.get('percentage', 'Def'))
+        final_reason = reason + log_retry
+        
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, "", mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
+        
         return jsonify(mapped)
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # --- IMPROVED ERROR LOGGING ---
-        # Combine the incoming reason (from TV) with the actual error
-        full_reason = f"{reason} | {str(e)}"
-        
-        # Get the intended percentage
-        pct = f"{data.get('PercentAmount', data.get('percentage', 0))}%"
-        
-        # Log: [Time, Symbol, SIDE, Pct, SignalPrice, "", 0, 0, "Error", FullReason, Wallet]
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, pct, price, "", 0, 0, "Error", full_reason, CACHE['wallet'].get('USDT', 0)]))
-        # ------------------------------
-        
+        log_pct = data.get('PercentAmount', data.get('percentage', 0))
+        full_err = f"{reason} | {str(e)}"
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, "", 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
 @app.route('/panic', methods=['POST'])
