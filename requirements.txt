@@ -1,7 +1,8 @@
 flask
-binance-connector
-gunicorn
+requests
 gspread>=5.10.0
 google-auth
-requests
-urllib3
+oauth2client
+ccxt
+tabulate
+gunicorn
