@@ -258,6 +258,10 @@ def webhook():
         
         st = get_state(symbol)
         if not is_cli and side == 'buy' and st['status'] == 'HOLDING':
+            # --- LOG THE SKIP ---
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", "Already Holding", CACHE['wallet'].get('USDT', 0)]))
+            # --------------------
             return jsonify({"status": "skipped", "msg": "Already Holding"})
         
         if is_cli or st['pending_limit']:
