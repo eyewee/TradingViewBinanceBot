@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Protocol Omega</title>
+    <style>
+        body { font-family: monospace; background: #000; color: #0f0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        input { background: #111; border: 1px solid #333; color: #fff; padding: 10px; font-size: 1.2rem; text-align: center; }
+        button { cursor: pointer; border: none; }
+        #auth-box { display: flex; flex-direction: column; gap: 10px; }
+        #panic-box { display: none; text-align: center; }
+        .panic-btn {
+            background: #d00; color: white; font-weight: bold; font-size: 2rem;
+            width: 250px; height: 250px; border-radius: 50%;
+            box-shadow: 0 0 20px #d00; animation: blink 0.8s infinite;
+        }
+        @keyframes blink { 0% { opacity: 1; box-shadow: 0 0 20px #d00; } 50% { opacity: 0.6; box-shadow: 0 0 5px #d00; } 100% { opacity: 1; box-shadow: 0 0 20px #d00; } }
+        #log { margin-top: 20px; white-space: pre-wrap; color: #888; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div id="auth-box">
+        <input type="password" id="passphrase" placeholder="PASSPHRASE">
+        <button onclick="verify()" style="padding: 10px; background: #333; color: white;">ACCESS</button>
+    </div>
+    <div id="panic-box">
+        <h2 id="target-display">TARGET: ???</h2>
+        <button class="panic-btn" onclick="executePanic()">SELL ALL</button>
+    </div>
+    <div id="log"></div>
+    <script>
+        let PASS = "";
+        async function verify() {
+            PASS = document.getElementById('passphrase').value;
+            const res = await fetch('/special/verify', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({passphrase: PASS})
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                document.getElementById('auth-box').style.display = 'none';
+                document.getElementById('panic-box').style.display = 'block';
+                document.getElementById('target-display').innerText = "TARGET: " + data.target;
+            } else alert("DENIED");
+        }
+        async function executePanic() {
+            if(!confirm("CONFIRM IMMEDIATE LIQUIDATION?")) return;
+            document.getElementById('log').innerText = "PROCESSING...";
+            const res = await fetch('/special/execute', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({passphrase: PASS})
+            });
+            const data = await res.json();
+            document.getElementById('log').innerText = (data.log || []).join("\n");
+        }
+    </script>
+</body>
+</html>
