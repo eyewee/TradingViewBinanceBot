@@ -399,10 +399,6 @@ def webhook():
             "cummulativeQuoteQty": resp.get('cost', 0), "price": resp.get('average', resp.get('price', 0))
         }
         
-        # Immediate Post-Trade Refresh (Optional but recommended for speed)
-        # We spawn a thread to do this so we don't delay the webhook response
-        threading.Thread(target=lambda: background_sync_func(), daemon=True).start()
-
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_pct = data.get('PercentAmount', data.get('percentage', 'Def'))
         final_reason = reason + log_retry
