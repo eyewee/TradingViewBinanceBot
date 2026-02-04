@@ -248,7 +248,7 @@ def webhook():
     base = symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT','')
     price = data.get('price', 'Market')
     otype = data.get('type', 'MARKET').lower()
-    reason = data.get('reason', '')
+    reason = data.get('reason', 'Signal') 
     is_cli = "CLI" in reason
 
     with STATE_LOCK:
@@ -261,13 +261,15 @@ def webhook():
         else:
             e2, slip = 100.0, 0.0
         
-        # State Check
+        # State Check (Memory)
         st = get_state(symbol)
         if not is_cli and side == 'buy' and st['status'] == 'HOLDING':
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", "Already Holding", CACHE['wallet'].get('USDT', 0)]))
-            return jsonify({"status": "skipped", "msg": "Already Holding"})
+            skip_msg = f"{reason} | Skipped: Already Holding"
+            LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
+            return jsonify({"status": "skipped", "msg": skip_msg})
         
+        # Pre-Trade Cleanup (Memory)
         if is_cli or st['pending_limit']:
             try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
             except: pass
@@ -285,6 +287,63 @@ def webhook():
 
         resp = {}
         log_retry = ""
+        log_price = price
+
+        # --- BULLETPROOF WRAPPER ---
+        def safe_execute(action_func, is_buy):
+            nonlocal log_retry
+            try:
+                # Attempt 1: Fast (Memory)
+                return action_func() 
+            except Exception as e:
+                # Attempt 2: Bulletproof Retry
+                # If ANY fund/state error occurs -> Force Clean & Retry
+                err_str = str(e).lower()
+                if "insufficient" in err_str or "balance" in err_str or "account" in err_str or "margin" in err_str:
+                    log_retry = " | Retry: Cleanup & Funds"
+                    
+                    # A. Force Cancel (Clear stuck orders)
+                    try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
+                    except: pass
+                    
+                    # B. Force Sync
+                    fresh = EXCHANGE_INSTANCE.fetch_balance()
+                    with STATE_LOCK:
+                        CACHE['wallet']['USDT'] = fresh['free'].get('USDT', 0.0)
+                        CACHE['wallet'][base] = fresh['free'].get(base, 0.0)
+                    
+                    # C. Recalculate with fresh balance
+                    if is_buy:
+                        # Recalc Buy Amount
+                        req_pct = float(data.get('PercentAmount', data.get('percentage', e2)))
+                        fresh_amt = CACHE['wallet']['USDT'] * (0.998 if req_pct >= 99.0 else req_pct / 100.0)
+                        
+                        if otype == 'limit':
+                            cur_p = safe_float(price)
+                            if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
+                            lim_p = float(data.get('limit_price', cur_p))
+                            if lim_p == 0: lim_p = cur_p
+                            lim_p *= (1 + (slip / 100.0))
+                            qty = fresh_amt / lim_p
+                            return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
+                        else:
+                            return EXCHANGE_INSTANCE.create_market_buy_order_with_cost(symbol, fresh_amt)
+                    else:
+                        # Recalc Sell Qty
+                        fresh_qty = CACHE['wallet'][base]
+                        req_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
+                        q = fresh_qty if req_pct >= 99.9 else fresh_qty * (req_pct / 100.0)
+                        
+                        if otype == 'limit':
+                            cur_p = safe_float(price)
+                            if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
+                            lim_p = float(data.get('limit_price', cur_p))
+                            if lim_p == 0: lim_p = cur_p
+                            lim_p *= (1 - (slip / 100.0))
+                            return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', q, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
+                        else:
+                            return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', q)
+                raise e
 
         # ==========================
         #       BUY LOGIC
@@ -292,14 +351,11 @@ def webhook():
         if side == 'buy':
             wallet_usdt = get_cached_balance("USDT")
             req_pct = float(data.get('PercentAmount', data.get('percentage', e2)))
-            
-            # --- SAFETY BUFFER (Restored) ---
-            # 99.8% to allow for fees/rounding
             amt_usdt = wallet_usdt * (0.998 if req_pct >= 99.0 else req_pct / 100.0)
-            if amt_usdt < 5: raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
 
-            # Define Execution Helper
-            def execute_buy(amount):
+            def run_buy():
+                if amt_usdt < 5: raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
+
                 if otype == 'limit':
                     cur_p = safe_float(price)
                     if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
@@ -307,32 +363,14 @@ def webhook():
                     if lim_p == 0: lim_p = cur_p
                     lim_p *= (1 + (slip / 100.0))
                     
-                    qty = amount / lim_p
+                    nonlocal log_price; log_price = lim_p
+                    qty = amt_usdt / lim_p
                     return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                 else:
-                    return EXCHANGE_INSTANCE.create_market_buy_order_with_cost(symbol, amount)
+                    return EXCHANGE_INSTANCE.create_market_buy_order_with_cost(symbol, amt_usdt)
 
-            try:
-                # Attempt 1: Fast (Memory)
-                resp = execute_buy(amt_usdt)
-            except Exception as e:
-                # Attempt 2: Bulletproof Retry
-                log_retry = " | Retry: Funds"
-                
-                # A. Force Cancel (Clear stuck orders)
-                try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
-                except: pass
-                
-                # B. Force Sync
-                fresh = EXCHANGE_INSTANCE.fetch_balance()
-                with STATE_LOCK: CACHE['wallet']['USDT'] = fresh['free'].get('USDT', 0.0)
-                
-                # C. Recalculate with fresh balance
-                fresh_amt = CACHE['wallet']['USDT'] * (0.998 if req_pct >= 99.0 else req_pct / 100.0)
-                resp = execute_buy(fresh_amt)
-
-            with STATE_LOCK:
-                BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': (otype == 'limit')})
+            resp = safe_execute(run_buy, is_buy=True)
+            with STATE_LOCK: BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': (otype == 'limit')})
 
         # ==========================
         #       SELL LOGIC
@@ -348,11 +386,18 @@ def webhook():
             
             # 2. Validation
             if coin_bal == 0:
+                # If we are trying to SELL but have NO COINS, it implies a stuck BUY.
+                # Force Cancel to unlock USDT.
+                try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
+                except: pass
+                
+                # Sync logic for clean state
+                threading.Thread(target=lambda: background_sync_func(), daemon=True).start()
+
                 with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
                 
-                # --- LOGGING ---
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                skip_msg = f"{reason} | Skipped: Wallet 0 ({base})"
+                skip_msg = f"{reason} | Skipped: Wallet 0 ({base}) [Stuck Orders Cancelled]"
                 LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
                 return jsonify({"status": "skipped", "msg": skip_msg})
 
@@ -360,44 +405,21 @@ def webhook():
             qty = float(data.get('quantity', 0))
             if qty == 0: qty = coin_bal * (req_pct / 100.0)
 
-            # Define Execution Helper
-            def execute_sell(q):
+            def run_sell():
                 if otype == 'limit':
                     cur_p = safe_float(price)
                     if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
                     lim_p = float(data.get('limit_price', cur_p))
                     if lim_p == 0: lim_p = cur_p
                     lim_p *= (1 - (slip / 100.0))
-                    return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', q, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
+                    
+                    nonlocal log_price; log_price = lim_p
+                    return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                 else:
-                    return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', q)
+                    return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', qty)
 
-            try:
-                # Attempt 1: Fast
-                resp = execute_sell(qty)
-            except Exception as e:
-                # Attempt 2: Bulletproof Retry
-                log_retry = " | Retry: Cleanup & Drift"
-                
-                # A. Force Cancel (Critical Addition)
-                try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
-                except: pass
-
-                # B. Force Sync
-                fresh = EXCHANGE_INSTANCE.fetch_balance()
-                real_qty = fresh['free'].get(base, 0.0)
-                
-                # Update Cache
-                with STATE_LOCK: CACHE['wallet'][base] = real_qty
-                
-                # C. Use Full Real Balance if 100%
-                if req_pct >= 99.9: qty = real_qty
-                else: qty = real_qty * (req_pct / 100.0)
-                
-                resp = execute_sell(qty)
-
-            with STATE_LOCK: 
-                BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': (otype == 'limit')})
+            resp = safe_execute(run_sell, is_buy=False)
+            with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': (otype == 'limit')})
 
         # ==========================
         #       LOGGING
@@ -410,18 +432,18 @@ def webhook():
         
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_pct = data.get('PercentAmount', data.get('percentage', 'Def'))
-        
         final_reason = f"{reason}{log_retry}"
         
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, "", mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
+        disp_price = log_price if otype == 'limit' else mapped['price']
+        
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", disp_price, "", mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
         
         return jsonify(mapped)
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_pct = data.get('PercentAmount', data.get('percentage', 0))
         full_err = f"{reason} | {str(e)}"
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, "", 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
 @app.route('/panic', methods=['POST'])
