@@ -434,15 +434,17 @@ def webhook():
         log_pct = data.get('PercentAmount', data.get('percentage', 'Def'))
         final_reason = f"{reason}{log_retry}"
         
-        disp_price = log_price if otype == 'limit' else mapped['price']
-        
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", disp_price, "", mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
+        # CORRECT MAPPING:
+        # Col E (Sent Price): log_price (Signal Price OR Calculated Limit Price)
+        # Col G (Exec Price): mapped['price'] (Actual Fill Price from Exchange)
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", log_price, "", mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
         
         return jsonify(mapped)
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_err = f"{reason} | {str(e)}"
+        # Error Log: Use 'price' (Signal Price) since we didn't execute
         LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
