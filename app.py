@@ -124,58 +124,86 @@ def background_sync_func():
     
     while True:
         try:
-            # Use Global Exchange Instance (It is thread-safe enough for fetch_balance)
             if not EXCHANGE_INSTANCE: 
                 time.sleep(1)
                 continue
                 
             sheet = None
-            if (tick % 3 == 0) or (tick % 6 == 0):
+            # Fetch sheet every 10 seconds
+            if tick % 5 == 0:
                 try: sheet = get_sheet()
                 except: pass
 
+            # 1. SYNC SETTINGS (Every 6 seconds)
             if tick % 3 == 0 and sheet:
                 try:
+                    # E2=%, G2=Type, K1=Slip, H2=Symbol (Fixed from H1)
                     data = sheet.batch_get(['E2', 'G2', 'K1', 'H2'])
                     val_e2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 100)
                     val_f2 = str(data[1][0][0]).upper() if (len(data)>1 and data[1]) else "MARKET"
                     val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data)>2 and data[2]) else 0)
-                    val_h1 = str(data[3][0][0]).strip().upper() if (len(data)>3 and data[3]) else ""
+                    val_h2 = str(data[3][0][0]).strip().upper() if (len(data)>3 and data[3]) else ""
+                    
                     with STATE_LOCK:
-                        BOT_SETTINGS.update({'e2_pct': val_e2, 'f2_type': val_f2, 'j2_slip': val_j2, 'active_symbol': val_h1})
-                except: pass
+                        BOT_SETTINGS.update({
+                            'e2_pct': val_e2, 
+                            'f2_type': val_f2, 
+                            'j2_slip': val_j2, 
+                            'active_symbol': val_h2
+                        })
+                except Exception as e: print(f"Settings Sync Error: {e}")
 
-            if tick % 2 == 0 and local_ex:
+            # 2. SYNC WALLET (Every 2 seconds)
+            # FIXED: Removed 'local_ex' check. Now uses EXCHANGE_INSTANCE directly.
+            if tick % 1 == 0:
                 try:
-                    # DIRECTLY USE EXCHANGE_INSTANCE
                     bal = EXCHANGE_INSTANCE.fetch_balance()
                     
                     with STATE_LOCK:
-                        CACHE['wallet'] = {}
+                        # Clear and update USDT balance
+                        CACHE['wallet'] = {'USDT': float(bal['free'].get('USDT', 0.0))}
+                        
+                        # Update other coin balances
                         for a, amt in bal['free'].items():
-                            if amt > 0: CACHE['wallet'][a] = float(amt)
-                        for a, amt in bal['total'].items():
+                            if amt > 0 and a != 'USDT': CACHE['wallet'][a] = float(amt)
+                        
+                        # Update State (Holding vs Empty)
+                        for a, total_amt in bal['total'].items():
                             if a == 'USDT': continue
-                            sym = f"{a}/USDT" 
-                            if amt > 0:
+                            sym = normalize_symbol(f"{a}USDT") 
+                            if total_amt > 0:
                                 if sym not in BOT_STATE: BOT_STATE[sym] = {}
                                 BOT_STATE[sym]['status'] = 'HOLDING'
-                                BOT_STATE[sym]['pending_limit'] = (bal['used'].get(a, 0) > 0)
+                                # Check if funds are locked in an order
+                                used_amt = bal['used'].get(a, 0.0)
+                                BOT_STATE[sym]['pending_limit'] = (used_amt > 0)
                             else:
                                 if sym in BOT_STATE and BOT_STATE[sym]['status'] == 'HOLDING':
                                      BOT_STATE[sym]['status'] = 'EMPTY'
                                      BOT_STATE[sym]['pending_limit'] = False
-                except: pass
+                except Exception as e: print(f"Wallet Sync Error: {e}")
 
-            if tick % 6 == 0 and sheet:
+            # 3. UPDATE DASHBOARD (Every 10 seconds)
+            if tick % 5 == 0 and sheet:
                 try:
-                    usdt = CACHE['wallet'].get('USDT', 0)
+                    usdt_val = CACHE['wallet'].get('USDT', 0.0)
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sheet.update('A2:B2', [[ts, usdt]])
-                    ms = BOT_SETTINGS.get('active_symbol', '').replace("USDT","").replace("/","").strip()
-                    if ms: sheet.update('I2', [[CACHE['wallet'].get(ms, 0.0)]])
-                except: pass
-        except: time.sleep(10)
+                    
+                    # Update A2 (Time) and B2 (USDT Balance)
+                    sheet.update('A2:B2', [[ts, usdt_val]])
+                    
+                    # Update I2 (Current Coin Balance)
+                    raw_ms = BOT_SETTINGS.get('active_symbol', '')
+                    ms = raw_ms.replace("USDT","").replace("/","").strip()
+                    if ms:
+                        coin_bal = CACHE['wallet'].get(ms, 0.0)
+                        sheet.update('I2', [[coin_bal]])
+                except Exception as e: print(f"Dashboard Update Error: {e}")
+
+        except Exception as e:
+            print(f"Main Loop Error: {e}")
+            time.sleep(5)
+            
         tick += 1
         time.sleep(2)
 
