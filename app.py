@@ -190,17 +190,27 @@ def background_sync_func():
             # 3. UPDATE DASHBOARD (Every 10 seconds)
             if tick % 5 == 0 and sheet:
                 try:
-                    usdt_val = CACHE['wallet'].get('USDT', 0.0)
+                    # Use a local copy to avoid dictionary size change errors during loop
+                    with STATE_LOCK:
+                        current_wallet = CACHE['wallet'].copy()
+                        active_sym = BOT_SETTINGS.get('active_symbol', '').upper()
+
+                    usdt_val = current_wallet.get('USDT', 0.0)
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
                     # Update A2 (Time) and B2 (USDT Balance)
                     sheet.update('A2:B2', [[ts, usdt_val]])
                     
-                    # Update I2 (Current Coin Balance)
-                    raw_ms = BOT_SETTINGS.get('active_symbol', '')
-                    ms = raw_ms.replace("USDT","").replace("/","").strip()
-                    if ms:
-                        coin_bal = CACHE['wallet'].get(ms, 0.0)
+                    # --- IMPROVED I2 LOGIC ---
+                    # Extract Asset Name (e.g., "PUMP/USDT" -> "PUMP")
+                    if active_sym:
+                        # Strip common suffixes and slashes
+                        asset_name = active_sym.replace("/USDT", "").replace("USDT", "").replace("/", "").strip()
+                        
+                        # Look up in wallet using the cleaned Asset Name
+                        coin_bal = current_wallet.get(asset_name, 0.0)
+                        
+                        # Update I2
                         sheet.update('I2', [[coin_bal]])
                 except Exception as e: print(f"Dashboard Update Error: {e}")
 
