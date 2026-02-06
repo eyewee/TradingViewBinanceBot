@@ -174,7 +174,7 @@ def background_sync_func():
                             if total_amt > 0:
                                 if sym not in BOT_STATE: BOT_STATE[sym] = {}
                                 BOT_STATE[sym]['status'] = 'HOLDING'
-                                # Check if funds are locked in an order
+                                # CRITICAL: Check Locked Balance
                                 used_amt = bal['used'].get(a, 0.0)
                                 BOT_STATE[sym]['pending_limit'] = (used_amt > 0)
                             else:
@@ -233,33 +233,43 @@ def special_verify():
 @app.route('/special/execute', methods=['POST'])
 def special_execute():
     if request.json.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Auth Failed"}), 403
+    
     raw_sym = request.json.get('symbol', BOT_SETTINGS.get('active_symbol', ''))
     if not raw_sym or raw_sym == "FORCE_SHEET": raw_sym = BOT_SETTINGS.get('active_symbol', '')
     
     symbol = normalize_symbol(raw_sym)
     base = symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT', '')
     
-    # 1. BRUTE FORCE CANCEL
+    # 1. UNLOCK PHASE
     log = brute_force_cancel(symbol)
     
     try:
-        # 2. FETCH TOTAL BALANCE (Reality Check)
+        # 2. FETCH FRESH BALANCE
         bal = EXCHANGE_INSTANCE.fetch_balance()
-        # We look at 'total' because after cancel, locked becomes free
-        total_qty = bal['total'].get(base, 0.0)
-        log.append(f"Total {base} detected: {total_qty}")
+        free_qty = bal['free'].get(base, 0.0)
+        locked_qty = bal['used'].get(base, 0.0)
+        
+        log.append(f"State: Free={free_qty} | Locked={locked_qty}")
         
         resp = "Nothing to sell"
-        if total_qty > 0:
-            # 3. MARKET SELL EVERYTHING
-            res = EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', total_qty)
-            log.append(f"PANIC SOLD {total_qty} {base}")
+        
+        # 3. SELL ONLY FREE FUNDS
+        if free_qty > 0:
+            # Use 'create_market_sell_order' explicitly
+            res = EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', free_qty)
+            log.append(f"PANIC SOLD {free_qty} {base}")
             resp = str(res.get('id', 'Filled'))
             
+            # Reset State
             with STATE_LOCK:
                 BOT_STATE[symbol] = {'status': 'EMPTY', 'pending_limit': False}
                 CACHE['wallet'][base] = 0.0
-        
+                # Force immediate background sync update
+                CACHE['wallet']['USDT'] = float(bal['free'].get('USDT', 0.0))
+
+        elif locked_qty > 0:
+            log.append("CRITICAL: Funds remained locked after cancel. Manual intervention on Binance required.")
+            
         return jsonify({"status": "Done", "log": log, "order": resp})
     except Exception as e:
         return jsonify({"status": "Error", "log": log + [str(e)]})
@@ -482,30 +492,42 @@ def webhook():
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
 def brute_force_cancel(symbol=None):
-    """Fetches all open orders and cancels them one by one."""
     log = []
-    try:
-        # 1. Fetch all open orders for the account
-        # (Pass symbol if you want to be specific, or None for everything)
-        open_orders = EXCHANGE_INSTANCE.fetch_open_orders(symbol)
-        
-        if not open_orders:
-            log.append("No open orders found to cancel.")
-            return log
+    found_orders = False
+    
+    # 1. Try Specific Symbol First
+    if symbol:
+        try:
+            orders = EXCHANGE_INSTANCE.fetch_open_orders(symbol)
+            for o in orders:
+                try:
+                    EXCHANGE_INSTANCE.cancel_order(o['id'], o['symbol'])
+                    log.append(f"Cancelled: {o['id']} ({o['symbol']})")
+                    found_orders = True
+                except Exception as e: log.append(f"Err {o['id']}: {e}")
+        except: pass
 
-        for o in open_orders:
-            o_id = o['id']
-            o_sym = o['symbol']
-            try:
-                EXCHANGE_INSTANCE.cancel_order(o_id, o_sym)
-                log.append(f"Cancelled Order {o_id} ({o_sym})")
-            except Exception as e:
-                log.append(f"Failed to cancel {o_id}: {str(e)}")
-        
-        # 2. Wait for exchange synchronization
-        time.sleep(1.0) 
-    except Exception as e:
-        log.append(f"Brute Force Cancel Error: {str(e)}")
+    # 2. If nothing found/cancelled, GO NUCLEAR (Fetch Global Orders)
+    if not found_orders:
+        try:
+            # fetch_open_orders without arguments fetches EVERYTHING
+            all_orders = EXCHANGE_INSTANCE.fetch_open_orders()
+            if not all_orders:
+                log.append("Binance says: No open orders anywhere.")
+            
+            for o in all_orders:
+                # Filter if we only want to nuke the target symbol
+                if symbol and symbol not in o['symbol'].replace("/", ""):
+                     continue
+                
+                try:
+                    EXCHANGE_INSTANCE.cancel_order(o['id'], o['symbol'])
+                    log.append(f"Global Nuke: {o['id']} ({o['symbol']})")
+                except Exception as e: log.append(f"Err {o['id']}: {e}")
+        except Exception as e:
+            log.append(f"Global Fetch Fail: {e}")
+
+    time.sleep(1.0) # Wait for Binance to unlock funds
     return log
 
 @app.route('/panic', methods=['POST'])
