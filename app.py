@@ -99,7 +99,13 @@ def get_state(symbol):
     return BOT_STATE[symbol]
 
 def logger_worker_func():
+    global LOG_QUEUE
+    print("Logger Thread Started")
     while True:
+         # --- MEMORY SAFETY (if google is down, don't spin eternally ---
+        if len(LOG_QUEUE) > 100:
+            LOG_QUEUE = LOG_QUEUE[-100:] # Keep only last 100 items
+            
         if len(LOG_QUEUE) > 0:
             task_type, data = LOG_QUEUE[0]
             try:
@@ -115,22 +121,14 @@ def logger_worker_func():
 def background_sync_func():
     time.sleep(2)
     tick = 0
-    local_ex = None
-    last_ex_name = ""
     
     while True:
         try:
-            if CURRENT_EXCHANGE_NAME != last_ex_name and CURRENT_EXCHANGE_NAME:
-                conf = EXCHANGE_CONFIG[CURRENT_EXCHANGE_NAME]
-                ex_c = getattr(ccxt, conf.get('exchange_id', 'binance'))
-                p = {'apiKey': conf.get('apiKey'), 'secret': conf.get('secret'), 'options': conf.get('options', {'defaultType': 'spot'})}
-                if conf.get('sandbox', False):
-                    p['sandbox'] = True
-                    if conf['exchange_id'] == 'binance':
-                         p['urls'] = {'api': {'public': 'https://testnet.binance.vision/api', 'private': 'https://testnet.binance.vision/api'}}
-                local_ex = ex_c(p)
-                last_ex_name = CURRENT_EXCHANGE_NAME
-
+            # Use Global Exchange Instance (It is thread-safe enough for fetch_balance)
+            if not EXCHANGE_INSTANCE: 
+                time.sleep(1)
+                continue
+                
             sheet = None
             if (tick % 3 == 0) or (tick % 6 == 0):
                 try: sheet = get_sheet()
@@ -149,7 +147,9 @@ def background_sync_func():
 
             if tick % 2 == 0 and local_ex:
                 try:
-                    bal = local_ex.fetch_balance()
+                    # DIRECTLY USE EXCHANGE_INSTANCE
+                    bal = EXCHANGE_INSTANCE.fetch_balance()
+                    
                     with STATE_LOCK:
                         CACHE['wallet'] = {}
                         for a, amt in bal['free'].items():
@@ -177,7 +177,7 @@ def background_sync_func():
                 except: pass
         except: time.sleep(10)
         tick += 1
-        time.sleep(3)
+        time.sleep(2)
 
 def ensure_threads_running():
     if THREADS["logger"] is None or not THREADS["logger"].is_alive():
@@ -389,10 +389,7 @@ def webhook():
                 # If we are trying to SELL but have NO COINS, it implies a stuck BUY.
                 # Force Cancel to unlock USDT.
                 try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
-                except: pass
-                
-                # Sync logic for clean state
-                threading.Thread(target=lambda: background_sync_func(), daemon=True).start()
+                except: pass             
 
                 with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
                 
