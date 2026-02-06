@@ -39,7 +39,11 @@ def load_exchange(config_name):
         params = {
             'apiKey': conf.get('apiKey'),
             'secret': conf.get('secret'),
-            'options': conf.get('options', {'defaultType': 'spot'})
+            'options': {
+                'defaultType': 'spot',
+                # --- ENABLE GLOBAL CANCEL ---
+                'warnOnFetchOpenOrdersWithoutSymbol': False 
+            }
         }
         if conf.get('sandbox', False):
             params['sandbox'] = True
