@@ -136,7 +136,7 @@ def background_sync_func():
 
             if tick % 3 == 0 and sheet:
                 try:
-                    data = sheet.batch_get(['E2', 'G2', 'K1', 'H2'])
+                    data = sheet.batch_get(['E2', 'G2', 'K1', 'I2'])
                     val_e2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 100)
                     val_f2 = str(data[1][0][0]).upper() if (len(data)>1 and data[1]) else "MARKET"
                     val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data)>2 and data[2]) else 0)
