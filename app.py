@@ -136,7 +136,7 @@ def background_sync_func():
 
             if tick % 3 == 0 and sheet:
                 try:
-                    data = sheet.batch_get(['E2', 'G2', 'K2', 'H1'])
+                    data = sheet.batch_get(['E2', 'G2', 'K1', 'H1'])
                     val_e2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 100)
                     val_f2 = str(data[1][0][0]).upper() if (len(data)>1 and data[1]) else "MARKET"
                     val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data)>2 and data[2]) else 0)
@@ -210,31 +210,31 @@ def special_execute():
     
     symbol = normalize_symbol(raw_sym)
     base = symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT', '')
-    log = []
+    
+    # 1. BRUTE FORCE CANCEL
+    log = brute_force_cancel(symbol)
     
     try:
-        try:
-            EXCHANGE_INSTANCE.cancel_all_orders(symbol)
-            log.append(f"Orders cancelled: {symbol}")
-        except: log.append("Cancel skipped.")
-        
-        time.sleep(1.0)
+        # 2. FETCH TOTAL BALANCE (Reality Check)
         bal = EXCHANGE_INSTANCE.fetch_balance()
-        qty = bal['free'].get(base, 0.0)
-        log.append(f"Free: {qty} {base}")
+        # We look at 'total' because after cancel, locked becomes free
+        total_qty = bal['total'].get(base, 0.0)
+        log.append(f"Total {base} detected: {total_qty}")
         
         resp = "Nothing to sell"
-        if qty > 0:
-            res = EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', qty)
-            log.append(f"SOLD {qty}")
+        if total_qty > 0:
+            # 3. MARKET SELL EVERYTHING
+            res = EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', total_qty)
+            log.append(f"PANIC SOLD {total_qty} {base}")
             resp = str(res.get('id', 'Filled'))
+            
             with STATE_LOCK:
-                BOT_STATE[symbol]['status'] = 'EMPTY'
-                BOT_STATE[symbol]['pending_limit'] = False
+                BOT_STATE[symbol] = {'status': 'EMPTY', 'pending_limit': False}
                 CACHE['wallet'][base] = 0.0
+        
         return jsonify({"status": "Done", "log": log, "order": resp})
     except Exception as e:
-        return jsonify({"status": "Error", "log": [str(e)]})
+        return jsonify({"status": "Error", "log": log + [str(e)]})
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -384,19 +384,27 @@ def webhook():
                  f = EXCHANGE_INSTANCE.fetch_balance()
                  coin_bal = f['free'].get(base, 0.0)
             
-            # 2. Validation
             if coin_bal == 0:
-                # If we are trying to SELL but have NO COINS, it implies a stuck BUY.
-                # Force Cancel to unlock USDT.
-                try: EXCHANGE_INSTANCE.cancel_all_orders(symbol)
-                except: pass             
-
-                with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
+                # REPLACEMENT LOGIC:
+                # 1. Use Brute Force Cancel
+                cancel_logs = brute_force_cancel(symbol)
+                cancel_msg = " | Cancelled Orders" if cancel_logs else ""
                 
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                skip_msg = f"{reason} | Skipped: Wallet 0 ({base}) [Stuck Orders Cancelled]"
-                LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
-                return jsonify({"status": "skipped", "msg": skip_msg})
+                # 2. Check if coins were unlocked
+                f = EXCHANGE_INSTANCE.fetch_balance()
+                new_free = f['free'].get(base, 0.0)
+                
+                if new_free > 0:
+                    # If coins appeared after cancel, DON'T SKIP. 
+                    # Continue to the execution part below.
+                    coin_bal = new_free
+                else:
+                    # Truly 0. Empty.
+                    with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    skip_msg = f"{reason} | Skipped: Wallet 0{cancel_msg}"
+                    LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
+                    return jsonify({"status": "skipped", "msg": skip_msg})
 
             req_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
             qty = float(data.get('quantity', 0))
@@ -444,6 +452,33 @@ def webhook():
         # Error Log: Use 'price' (Signal Price) since we didn't execute
         LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
         return jsonify({"status": "error", "msg": str(e), "code": 500})
+
+def brute_force_cancel(symbol=None):
+    """Fetches all open orders and cancels them one by one."""
+    log = []
+    try:
+        # 1. Fetch all open orders for the account
+        # (Pass symbol if you want to be specific, or None for everything)
+        open_orders = EXCHANGE_INSTANCE.fetch_open_orders(symbol)
+        
+        if not open_orders:
+            log.append("No open orders found to cancel.")
+            return log
+
+        for o in open_orders:
+            o_id = o['id']
+            o_sym = o['symbol']
+            try:
+                EXCHANGE_INSTANCE.cancel_order(o_id, o_sym)
+                log.append(f"Cancelled Order {o_id} ({o_sym})")
+            except Exception as e:
+                log.append(f"Failed to cancel {o_id}: {str(e)}")
+        
+        # 2. Wait for exchange synchronization
+        time.sleep(1.0) 
+    except Exception as e:
+        log.append(f"Brute Force Cancel Error: {str(e)}")
+    return log
 
 @app.route('/panic', methods=['POST'])
 def panic():
