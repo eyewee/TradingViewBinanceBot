@@ -178,7 +178,6 @@ def background_sync_func():
                             if total_amt > 0:
                                 if sym not in BOT_STATE: BOT_STATE[sym] = {}
                                 BOT_STATE[sym]['status'] = 'HOLDING'
-                                # CRITICAL: Check Locked Balance
                                 used_amt = bal['used'].get(a, 0.0)
                                 BOT_STATE[sym]['pending_limit'] = (used_amt > 0)
                             else:
@@ -301,9 +300,10 @@ def webhook():
     price = data.get('price', 'Market')
     otype = data.get('type', 'MARKET').lower()
     reason = data.get('reason', 'Signal') 
-    calc_p = price # Default to received price
+
+   # Initialize calc_p in the outer scope
+    calc_p = price 
     is_cli = "CLI" in reason
-   
 
     with STATE_LOCK:
         # Settings Override
@@ -345,7 +345,7 @@ def webhook():
 
         # --- BULLETPROOF WRAPPER ---
         def safe_execute(action_func, is_buy):
-            nonlocal log_retry
+            nonlocal log_retry, calc_p
             try:
                 # Attempt 1: Fast (Memory)
                 return action_func() 
@@ -378,7 +378,7 @@ def webhook():
                             lim_p = float(data.get('limit_price', cur_p))
                             if lim_p == 0: lim_p = cur_p
                             lim_p *= (1 + (slip / 100.0))
-                            nonlocal calc_p; calc_p = lim_p  # Store the calculated price
+                            calc_p = lim_p
                             qty = fresh_amt / lim_p
                             return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                         else:
@@ -410,6 +410,7 @@ def webhook():
             amt_usdt = wallet_usdt * (0.998 if req_pct >= 99.0 else req_pct / 100.0)
 
             def run_buy():
+                nonlocal calc_p, log_price
                 if amt_usdt < 5: raise Exception(f"Insufficient USDT: {amt_usdt:.2f}")
 
                 if otype == 'limit':
@@ -418,8 +419,8 @@ def webhook():
                     lim_p = float(data.get('limit_price', cur_p))
                     if lim_p == 0: lim_p = cur_p
                     lim_p *= (1 + (slip / 100.0))
-                    nonlocal calc_p; calc_p = lim_p  # Store the calculated price
-                    nonlocal log_price; log_price = lim_p
+                    calc_p = lim_p  # Store the calculated price
+                    log_price = lim_p
                     qty = amt_usdt / lim_p
                     return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                 else:
@@ -467,14 +468,15 @@ def webhook():
             if qty == 0: qty = coin_bal * (req_pct / 100.0)
 
             def run_sell():
+                nonlocal calc_p, log_price
                 if otype == 'limit':
                     cur_p = safe_float(price)
                     if cur_p == 0: cur_p = float(EXCHANGE_INSTANCE.fetch_ticker(symbol)['last'])
                     lim_p = float(data.get('limit_price', cur_p))
                     if lim_p == 0: lim_p = cur_p
                     lim_p *= (1 - (slip / 100.0))
-                    nonlocal calc_p; calc_p = lim_p  # Store the calculated price
-                    nonlocal log_price; log_price = lim_p
+                    calc_p = lim_p  # Store the calculated price
+                    log_price = lim_p
                     return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                 else:
                     return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', qty)
