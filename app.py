@@ -395,7 +395,7 @@ def webhook():
                             lim_p = float(data.get('limit_price', cur_p))
                             if lim_p == 0: lim_p = cur_p
                             lim_p *= (1 - (slip / 100.0))
-                            nonlocal calc_p; calc_p = lim_p  # Store the calculated price
+                            calc_p = lim_p  # Store the calculated price
                             return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', q, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                         else:
                             return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', q)
