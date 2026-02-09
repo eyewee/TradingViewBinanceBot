@@ -301,7 +301,9 @@ def webhook():
     price = data.get('price', 'Market')
     otype = data.get('type', 'MARKET').lower()
     reason = data.get('reason', 'Signal') 
+    calc_p = price # Default to received price
     is_cli = "CLI" in reason
+   
 
     with STATE_LOCK:
         # Settings Override
@@ -376,6 +378,7 @@ def webhook():
                             lim_p = float(data.get('limit_price', cur_p))
                             if lim_p == 0: lim_p = cur_p
                             lim_p *= (1 + (slip / 100.0))
+                            nonlocal calc_p; calc_p = lim_p  # Store the calculated price
                             qty = fresh_amt / lim_p
                             return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                         else:
@@ -392,6 +395,7 @@ def webhook():
                             lim_p = float(data.get('limit_price', cur_p))
                             if lim_p == 0: lim_p = cur_p
                             lim_p *= (1 - (slip / 100.0))
+                            nonlocal calc_p; calc_p = lim_p  # Store the calculated price
                             return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', q, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                         else:
                             return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', q)
@@ -414,7 +418,7 @@ def webhook():
                     lim_p = float(data.get('limit_price', cur_p))
                     if lim_p == 0: lim_p = cur_p
                     lim_p *= (1 + (slip / 100.0))
-                    
+                    nonlocal calc_p; calc_p = lim_p  # Store the calculated price
                     nonlocal log_price; log_price = lim_p
                     qty = amt_usdt / lim_p
                     return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'buy', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
@@ -469,7 +473,7 @@ def webhook():
                     lim_p = float(data.get('limit_price', cur_p))
                     if lim_p == 0: lim_p = cur_p
                     lim_p *= (1 - (slip / 100.0))
-                    
+                    nonlocal calc_p; calc_p = lim_p  # Store the calculated price
                     nonlocal log_price; log_price = lim_p
                     return EXCHANGE_INSTANCE.create_order(symbol, 'limit', 'sell', qty, lim_p, {'timeInForce': data.get('timeInForce', 'GTC')})
                 else:
@@ -491,10 +495,11 @@ def webhook():
         log_pct = data.get('PercentAmount', data.get('percentage', 'Def'))
         final_reason = f"{reason}{log_retry}"
         
-        # CORRECT MAPPING:
-        # Col E (Sent Price): log_price (Signal Price OR Calculated Limit Price)
-        # Col G (Exec Price): mapped['price'] (Actual Fill Price from Exchange)
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", log_price, "", mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
+        # Correct Column Mapping:
+        # Col E (Sent/Received): price (Market or original JSON price)
+        # Col F (Calculated): calc_p (Price adjusted with slip %)
+        # Col G (Exec): mapped['price'] (Actual fill price)
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
         
         return jsonify(mapped)
 
@@ -502,7 +507,8 @@ def webhook():
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_err = f"{reason} | {str(e)}"
         # Error Log: Use 'price' (Signal Price) since we didn't execute
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
+        # Ensure error logs also follow the new column order
+        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
 def brute_force_cancel(symbol=None):
