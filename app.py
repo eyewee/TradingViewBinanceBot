@@ -30,6 +30,9 @@ STATE_LOCK = threading.Lock()
 LOG_QUEUE = []
 THREADS = {"logger": None, "sync": None}
 
+PENDING_LOG_UPDATES = {}   # order_id -> {"symbol":..., "row": int, "side":..., "status":...}
+ORDER_ROW_LOCK = threading.Lock()
+
 def load_exchange(config_name):
     global EXCHANGE_INSTANCE, CURRENT_EXCHANGE_NAME
     if config_name not in EXCHANGE_CONFIG: return False
@@ -107,20 +110,139 @@ def logger_worker_func():
     print("Logger Thread Started")
     while True:
          # --- MEMORY SAFETY (if google is down, don't spin eternally ---
-        if len(LOG_QUEUE) > 100:
-            LOG_QUEUE = LOG_QUEUE[-100:] # Keep only last 100 items
+        if len(LOG_QUEUE) > 200:
+            LOG_QUEUE = LOG_QUEUE[-200:] # Keep only last 200 items
             
         if len(LOG_QUEUE) > 0:
-            task_type, data = LOG_QUEUE[0]
+            task = LOG_QUEUE[0]
             try:
                 sheet = get_sheet()
+
+                # Backward compatibility: old tuples ('LOG', data)
+                if isinstance(task, tuple) and len(task) == 2:
+                    task_type, data = task
+                    meta = {}
+                else:
+                    # New format: ('LOG', row_data, meta_dict)
+                    task_type = task[0]
+                    data = task[1]
+                    meta = task[2] if len(task) > 2 else {}
+
                 if task_type == 'LOG':
                     col_a = sheet.col_values(1)
                     nr = max(len(col_a) + 1, 6)
                     sheet.update(f'A{nr}:K{nr}', [data])
+
+                    # If this is an OPEN order, remember which sheet row belongs to which exchange order id
+                    order_id = meta.get("order_id")
+                    initial_status = str(meta.get("status", "")).lower()
+                    if order_id and initial_status in ("open", "new", "partially_filled", "partiallyfilled"):
+                        with ORDER_ROW_LOCK:
+                            PENDING_LOG_UPDATES[str(order_id)] = {
+                                "symbol": meta.get("symbol"),
+                                "row": nr,
+                                "side": str(meta.get("side", "")).lower(),
+                                "status": initial_status
+                            }
+
+                elif task_type == 'UPDATE_ROW':
+                    # data = {"row":int, "exec_price":..., "exec_qty":..., "status":..., "capital":...}
+                    row = int(data["row"])
+
+                    # G=Exec price, H=Exec qty, I=Status, K=Capital
+                    # We can update non-adjacent ranges in 2 calls
+                    sheet.update(f'G{row}:I{row}', [[
+                        data.get("exec_price", 0),
+                        data.get("exec_qty", 0),
+                        data.get("status", "")
+                    ]])
+                    sheet.update(f'K{row}', [[data.get("capital", 0)]])
+
                 LOG_QUEUE.pop(0)
-            except: time.sleep(5)
+
+            except Exception:
+                time.sleep(5)
+
         time.sleep(1)
+
+def poll_pending_order_rows():
+    """
+    Checks tracked OPEN orders and updates their existing sheet row when status changes
+    (especially when they become CLOSED and exec qty/price become available).
+    """
+    if not EXCHANGE_INSTANCE:
+        return
+
+    with ORDER_ROW_LOCK:
+        pending_items = list(PENDING_LOG_UPDATES.items())
+
+    if not pending_items:
+        return
+
+    for order_id, info in pending_items:
+        symbol = info.get("symbol")
+        row = info.get("row")
+        side = info.get("side", "")
+
+        if not symbol or not row:
+            continue
+
+        try:
+            # fetch_order is supported by most ccxt exchanges (including Binance spot)
+            o = EXCHANGE_INSTANCE.fetch_order(order_id, symbol)
+            if not o:
+                continue
+
+            new_status = str(o.get("status", "")).lower()
+            # Ignore if still open
+            if new_status in ("open", "new"):
+                continue
+
+            # Refresh wallet so K gets the *real* post-fill USDT
+            bal = refresh_wallet_cache_for_symbol(symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT', ''))
+            usdt_now = 0.0
+            if bal:
+                usdt_now = float(bal['free'].get('USDT', 0.0))
+            else:
+                usdt_now = get_cached_balance("USDT")
+
+            exec_price = o.get("average", o.get("price", 0)) or 0
+            exec_qty = o.get("filled", 0) or 0
+
+            LOG_QUEUE.append((
+                'UPDATE_ROW',
+                {
+                    "row": row,
+                    "exec_price": exec_price,
+                    "exec_qty": exec_qty,
+                    "status": o.get("status", ""),
+                    "capital": usdt_now
+                }
+            ))
+
+            # Update in-memory state based on final status
+            if new_status == "closed":
+                with STATE_LOCK:
+                    if symbol not in BOT_STATE:
+                        BOT_STATE[symbol] = {"status": "EMPTY", "pending_limit": False}
+                    if side == "buy":
+                        BOT_STATE[symbol]["status"] = "HOLDING"
+                    elif side == "sell":
+                        BOT_STATE[symbol]["status"] = "EMPTY"
+                    BOT_STATE[symbol]["pending_limit"] = False
+
+            elif new_status in ("canceled", "cancelled", "rejected", "expired"):
+                with STATE_LOCK:
+                    if symbol in BOT_STATE:
+                        BOT_STATE[symbol]["pending_limit"] = False
+
+            # Done tracking this row
+            with ORDER_ROW_LOCK:
+                PENDING_LOG_UPDATES.pop(order_id, None)
+
+        except Exception as e:
+            # Safe to ignore transient errors; background loop will retry
+            print(f"Pending Order Poll Error [{order_id}]: {e}")
 
 def background_sync_func():
     time.sleep(2)
@@ -185,6 +307,13 @@ def background_sync_func():
                                      BOT_STATE[sym]['status'] = 'EMPTY'
                                      BOT_STATE[sym]['pending_limit'] = False
                 except Exception as e: print(f"Wallet Sync Error: {e}")
+                
+            # 2.5. POLL OPEN LIMIT ORDERS AND UPDATE THEIR LOG ROWS
+            if tick % 1 == 0:
+                try:
+                    poll_pending_order_rows()
+                except Exception as e:
+                    print(f"Pending Poll Loop Error: {e}")  
 
             # 3. UPDATE DASHBOARD (Every 10 seconds)
             if tick % 5 == 0 and sheet:
@@ -211,7 +340,7 @@ def background_sync_func():
                         
                         # Update I2
                         sheet.update('I2', [[coin_bal]])
-                except Exception as e: print(f"Dashboard Update Error: {e}")
+                except Exception as e: print(f"Dashboard Update Error: {e}")              
 
         except Exception as e:
             print(f"Main Loop Error: {e}")
@@ -286,6 +415,22 @@ def special_execute():
         return jsonify({"status": "Done", "log": log, "order": resp})
     except Exception as e:
         return jsonify({"status": "Error", "log": log + [str(e)]})
+
+def refresh_wallet_cache_for_symbol(base_asset=None):
+    """
+    Pull fresh exchange balance and update CACHE immediately.
+    Returns fresh balance dict or None.
+    """
+    try:
+        bal = EXCHANGE_INSTANCE.fetch_balance()
+        with STATE_LOCK:
+            CACHE['wallet']['USDT'] = float(bal['free'].get('USDT', 0.0))
+            if base_asset:
+                CACHE['wallet'][base_asset] = float(bal['free'].get(base_asset, 0.0))
+        return bal
+    except Exception as e:
+        print(f"Immediate Wallet Refresh Error: {e}")
+        return None
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -427,7 +572,12 @@ def webhook():
                     return EXCHANGE_INSTANCE.create_market_buy_order_with_cost(symbol, amt_usdt)
 
             resp = safe_execute(run_buy, is_buy=True)
-            with STATE_LOCK: BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': (otype == 'limit')})
+
+            # Immediate wallet refresh so K column logs current USDT (especially for MARKET buys)
+            refresh_wallet_cache_for_symbol(base)
+
+            with STATE_LOCK:
+                BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': (otype == 'limit')})
 
         # ==========================
         #       SELL LOGIC
@@ -482,7 +632,12 @@ def webhook():
                     return EXCHANGE_INSTANCE.create_order(symbol, 'market', 'sell', qty)
 
             resp = safe_execute(run_sell, is_buy=False)
-            with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': (otype == 'limit')})
+
+            # Immediate wallet refresh so K column logs post-sell USDT (fixes stale K bug)
+            refresh_wallet_cache_for_symbol(base)
+
+            with STATE_LOCK:
+                BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': (otype == 'limit')})
 
         # ==========================
         #       LOGGING
@@ -501,7 +656,22 @@ def webhook():
         # Col E (Sent/Received): price (Market or original JSON price)
         # Col F (Calculated): calc_p (Price adjusted with slip %)
         # Col G (Exec): mapped['price'] (Actual fill price)
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, mapped['price'], mapped['executedQty'], mapped['status'], final_reason, CACHE['wallet'].get('USDT')]))
+        row_data = [
+            ts, symbol, side, f"{log_pct}%", price, calc_p,
+            mapped['price'], mapped['executedQty'], mapped['status'], final_reason,
+            CACHE['wallet'].get('USDT')
+        ]
+
+        LOG_QUEUE.append((
+            'LOG',
+            row_data,
+            {
+                "order_id": str(resp.get('id', '')) if resp else '',
+                "symbol": resp.get('symbol', symbol),
+                "side": side,
+                "status": mapped.get('status', '')
+            }
+        ))
         
         return jsonify(mapped)
 
