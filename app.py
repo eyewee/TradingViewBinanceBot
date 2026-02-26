@@ -117,6 +117,9 @@ def get_state(symbol):
             "pending_side": None,        # "buy" or "sell"
             "pending_ts": None,          # time.time() when limit was placed
             "pending_quote_cost": None,  # intended USDT spend for LIMIT BUY
+            "pending_reason": None,      # strategy reason (for timeout log formatting)
+            "pending_pct": None,         # requested percent (for timeout log)
+            "pending_log_price": None,   # logged signal/limit price
             "timeout_inflight": False    # prevents double-timeout actions
         }
     else:
@@ -126,6 +129,9 @@ def get_state(symbol):
         BOT_STATE[symbol].setdefault("pending_side", None)
         BOT_STATE[symbol].setdefault("pending_ts", None)
         BOT_STATE[symbol].setdefault("pending_quote_cost", None)
+        BOT_STATE[symbol].setdefault("pending_reason", None)
+        BOT_STATE[symbol].setdefault("pending_pct", None)
+        BOT_STATE[symbol].setdefault("pending_log_price", None)
         BOT_STATE[symbol].setdefault("timeout_inflight", False)
     return BOT_STATE[symbol]
 
@@ -348,6 +354,9 @@ def handle_limit_timeouts():
                 with STATE_LOCK:
                     s = get_state(symbol)
                     s["timeout_inflight"] = False
+                    pending_reason = s.get("pending_reason") or ""
+                    pending_pct = s.get("pending_pct")
+                    pending_log_price = s.get("pending_log_price")
                 continue
 
             st = str(o.get("status", "")).lower()
@@ -485,23 +494,25 @@ def handle_limit_timeouts():
             conv_status = (market_resp or {}).get("status", "closed") if market_resp else "Error"
 
             msg = (
-                f"LimitTimeout(F2={int(timeout_sec)}s): canceled {oid}, "
-                f"limit_filled={filled_qty}, limit_remaining={remaining_base}, "
-                f"converted_to_market_id={market_id or 'N/A'}"
+                f"{pending_reason} | Timeout={int(timeout_sec)}S"
+                f" | canceled {oid}"
+                f" | limit_filled={filled_qty}"
+                f" | limit_remaining={remaining_base}"
+                f" | converted_to_market_id={market_id or 'N/A'}"
             )
 
             row_data = [
                 ts,
                 symbol,
                 str(side).lower(),
-                "0%",
-                "Timeout",          # Col E (Sent/Received): label instead of a price
-                "Market",           # Col F (Calculated): market
-                conv_exec_price,    # Col G (Exec)
-                conv_exec_qty,      # Col H (Exec qty)
-                conv_status,        # Col I (Status)
-                msg,                # Col J (Reason)
-                CACHE["wallet"].get("USDT", 0.0)  # Col K (Capital)
+                "100%",
+                conv_exec_price,  # Col E: executed market price
+                "Market",         # Col F: type marker
+                conv_exec_price,  # Col G: exec price
+                conv_exec_qty,    # Col H: exec qty
+                conv_status,      # Col I: status
+                msg,              # Col J: reason
+                CACHE["wallet"].get("USDT", 0.0)
             ]
 
             with LOG_LOCK:
@@ -879,7 +890,10 @@ def webhook():
                     st["pending_order_id"] = order_id
                     st["pending_side"] = "buy"
                     st["pending_ts"] = time.time()
-                    st["pending_quote_cost"] = float(amt_usdt)
+                    st["pending_quote_cost"] = float(amt_usdt)   
+                    st["pending_reason"] = reason
+                    st["pending_pct"] = req_pct
+                    st["pending_log_price"] = log_price   
                 else:
                     st["status"] = "HOLDING" if order_status == "closed" else st["status"]
                     st["pending_limit"] = False
@@ -887,6 +901,9 @@ def webhook():
                     st["pending_side"] = None
                     st["pending_ts"] = None
                     st["pending_quote_cost"] = None
+                    st["pending_reason"] = None
+                    st["pending_pct"] = None
+                    st["pending_log_price"] = None
 
         # ==========================
         #       SELL LOGIC
@@ -964,6 +981,9 @@ def webhook():
                     st["pending_side"] = "sell"
                     st["pending_ts"] = time.time()
                     st["pending_quote_cost"] = None  # only meaningful for LIMIT BUY timeout conversion
+                    st["pending_reason"] = reason
+                    st["pending_pct"] = req_pct
+                    st["pending_log_price"] = log_price
                 else:
                     st["status"] = "EMPTY" if order_status == "closed" else st["status"]
                     st["pending_limit"] = False
@@ -971,6 +991,9 @@ def webhook():
                     st["pending_side"] = None
                     st["pending_ts"] = None
                     st["pending_quote_cost"] = None
+                    st["pending_reason"] = None
+                    st["pending_pct"] = None
+                    st["pending_log_price"] = None
 
         # ==========================
         #       LOGGING
