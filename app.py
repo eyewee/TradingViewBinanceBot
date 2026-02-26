@@ -102,7 +102,18 @@ def normalize_symbol(user_input):
 
 def get_state(symbol):
     if symbol not in BOT_STATE:
-        BOT_STATE[symbol] = {"status": "EMPTY", "pending_limit": False}
+        BOT_STATE[symbol] = {
+            "status": "EMPTY",          # EMPTY | HOLDING | PENDING
+            "pending_limit": False,
+            "pending_order_id": None,   # exchange order id we’re waiting on
+            "pending_side": None        # "buy" or "sell"
+        }
+    else:
+        # Upgrade older dicts safely
+        BOT_STATE[symbol].setdefault("status", "EMPTY")
+        BOT_STATE[symbol].setdefault("pending_limit", False)
+        BOT_STATE[symbol].setdefault("pending_order_id", None)
+        BOT_STATE[symbol].setdefault("pending_side", None)
     return BOT_STATE[symbol]
 
 def logger_worker_func():
@@ -244,6 +255,51 @@ def poll_pending_order_rows():
             # Safe to ignore transient errors; background loop will retry
             print(f"Pending Order Poll Error [{order_id}]: {e}")
 
+def poll_pending_order_state():
+    """
+    Single source of truth for HOLDING/EMPTY:
+    - If pending_order_id exists: check exchange order status.
+    - When order closes: BUY => HOLDING, SELL => EMPTY.
+    Balances never set status.
+    """
+    if not EXCHANGE_INSTANCE:
+        return
+
+    with STATE_LOCK:
+        pending_list = [
+            (sym, st.get("pending_order_id"), st.get("pending_side"))
+            for sym, st in BOT_STATE.items()
+            if st.get("pending_order_id")
+        ]
+
+    for sym, oid, pside in pending_list:
+        if not oid or not pside:
+            continue
+        try:
+            o = EXCHANGE_INSTANCE.fetch_order(oid, sym)
+            if not o:
+                continue
+
+            st = str(o.get("status", "")).lower()
+
+            # Still open -> stay pending
+            if st in ("open", "new"):
+                continue
+
+            # Terminal -> clear pending
+            with STATE_LOCK:
+                s = get_state(sym)
+                s["pending_order_id"] = None
+                s["pending_side"] = None
+                s["pending_limit"] = False
+
+                if st == "closed":
+                    s["status"] = "HOLDING" if pside == "buy" else "EMPTY"
+                # canceled/rejected/expired: keep previous status, just not pending
+
+        except Exception as e:
+            print(f"Pending State Poll Error [{sym} {oid}]: {e}")
+
 def background_sync_func():
     time.sleep(2)
     tick = 0
@@ -291,29 +347,23 @@ def background_sync_func():
                         
                         # Update other coin balances
                         for a, amt in bal['free'].items():
-                            if amt > 0 and a != 'USDT': CACHE['wallet'][a] = float(amt)
+                            if amt > 0 and a != 'USDT': CACHE['wallet'][a] = float(amt)                        
                         
-                        # Update State (Holding vs Empty)
-                        for a, total_amt in bal['total'].items():
-                            if a == 'USDT': continue
-                            sym = normalize_symbol(f"{a}USDT") 
-                            if total_amt > 0:
-                                if sym not in BOT_STATE: BOT_STATE[sym] = {}
-                                BOT_STATE[sym]['status'] = 'HOLDING'
-                                used_amt = bal['used'].get(a, 0.0)
-                                BOT_STATE[sym]['pending_limit'] = (used_amt > 0)
-                            else:
-                                if sym in BOT_STATE and BOT_STATE[sym]['status'] == 'HOLDING':
-                                     BOT_STATE[sym]['status'] = 'EMPTY'
-                                     BOT_STATE[sym]['pending_limit'] = False
-                except Exception as e: print(f"Wallet Sync Error: {e}")
-                
+                except Exception as e: print(f"Wallet Sync Error: {e}")         
+                   
             # 2.5. POLL OPEN LIMIT ORDERS AND UPDATE THEIR LOG ROWS
             if tick % 1 == 0:
                 try:
                     poll_pending_order_rows()
                 except Exception as e:
                     print(f"Pending Poll Loop Error: {e}")  
+                    
+            # 2.6. RESOLVE ORDER-TRUTH STATE (PENDING -> HOLDING/EMPTY)
+            if tick % 1 == 0:
+                try:
+                    poll_pending_order_state()
+                except Exception as e:
+                    print(f"Pending State Loop Error: {e}")
 
             # 3. UPDATE DASHBOARD (Every 10 seconds)
             if tick % 5 == 0 and sheet:
@@ -462,9 +512,9 @@ def webhook():
         
         # State Check (Memory)
         st = get_state(symbol)
-        if not is_cli and side == 'buy' and st['status'] == 'HOLDING':
+        if not is_cli and side == 'buy' and st['status'] in ('HOLDING', 'PENDING'):
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            skip_msg = f"{reason} | Skipped: Already Holding"
+            skip_msg = f"{reason} | Skipped: Already Holding or Pending"
             LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
             return jsonify({"status": "skipped", "msg": skip_msg})
         
@@ -577,7 +627,21 @@ def webhook():
             refresh_wallet_cache_for_symbol(base)
 
             with STATE_LOCK:
-                BOT_STATE[symbol].update({'status': 'HOLDING', 'pending_limit': (otype == 'limit')})
+                st = get_state(symbol)
+                order_status = str(resp.get("status", "")).lower()
+                order_id = str(resp.get("id", "")) if resp else None
+
+                if order_status in ("open", "new") or otype == "limit":
+                    st["status"] = "PENDING"
+                    st["pending_limit"] = True
+                    st["pending_order_id"] = order_id
+                    st["pending_side"] = "buy"
+                else:
+                    # market order usually closed immediately
+                    st["status"] = "HOLDING" if order_status == "closed" else st["status"]
+                    st["pending_limit"] = False
+                    st["pending_order_id"] = None
+                    st["pending_side"] = None
 
         # ==========================
         #       SELL LOGIC
@@ -637,7 +701,20 @@ def webhook():
             refresh_wallet_cache_for_symbol(base)
 
             with STATE_LOCK:
-                BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': (otype == 'limit')})
+                st = get_state(symbol)
+                order_status = str(resp.get("status", "")).lower()
+                order_id = str(resp.get("id", "")) if resp else None
+
+                if order_status in ("open", "new") or otype == "limit":
+                    st["status"] = "PENDING"
+                    st["pending_limit"] = True
+                    st["pending_order_id"] = order_id
+                    st["pending_side"] = "sell"
+                else:
+                    st["status"] = "EMPTY" if order_status == "closed" else st["status"]
+                    st["pending_limit"] = False
+                    st["pending_order_id"] = None
+                    st["pending_side"] = None
 
         # ==========================
         #       LOGGING
