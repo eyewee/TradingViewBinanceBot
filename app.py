@@ -178,8 +178,8 @@ def logger_worker_func():
 
 def poll_pending_order_rows():
     """
-    Checks tracked OPEN orders and updates their existing sheet row when status changes
-    (especially when they become CLOSED and exec qty/price become available).
+    Only updates Google Sheet rows for previously-logged OPEN orders.
+    MUST NOT touch BOT_STATE (order-truth state is handled in poll_pending_order_state()).
     """
     if not EXCHANGE_INSTANCE:
         return
@@ -193,29 +193,23 @@ def poll_pending_order_rows():
     for order_id, info in pending_items:
         symbol = info.get("symbol")
         row = info.get("row")
-        side = info.get("side", "")
-
         if not symbol or not row:
             continue
 
         try:
-            # fetch_order is supported by most ccxt exchanges (including Binance spot)
             o = EXCHANGE_INSTANCE.fetch_order(order_id, symbol)
             if not o:
                 continue
 
             new_status = str(o.get("status", "")).lower()
-            # Ignore if still open
+
+            # Still open → nothing to update yet
             if new_status in ("open", "new"):
                 continue
 
-            # Refresh wallet so K gets the *real* post-fill USDT
+            # Get a fresh USDT snapshot for column K (optional but nice)
             bal = refresh_wallet_cache_for_symbol(symbol.split('/')[0] if '/' in symbol else symbol.replace('USDT', ''))
-            usdt_now = 0.0
-            if bal:
-                usdt_now = float(bal['free'].get('USDT', 0.0))
-            else:
-                usdt_now = get_cached_balance("USDT")
+            usdt_now = float(bal['free'].get('USDT', 0.0)) if bal else get_cached_balance("USDT")
 
             exec_price = o.get("average", o.get("price", 0)) or 0
             exec_qty = o.get("filled", 0) or 0
@@ -231,28 +225,11 @@ def poll_pending_order_rows():
                 }
             ))
 
-            # Update in-memory state based on final status
-            if new_status == "closed":
-                with STATE_LOCK:
-                    if symbol not in BOT_STATE:
-                        BOT_STATE[symbol] = {"status": "EMPTY", "pending_limit": False}
-                    if side == "buy":
-                        BOT_STATE[symbol]["status"] = "HOLDING"
-                    elif side == "sell":
-                        BOT_STATE[symbol]["status"] = "EMPTY"
-                    BOT_STATE[symbol]["pending_limit"] = False
-
-            elif new_status in ("canceled", "cancelled", "rejected", "expired"):
-                with STATE_LOCK:
-                    if symbol in BOT_STATE:
-                        BOT_STATE[symbol]["pending_limit"] = False
-
-            # Done tracking this row
+            # Done tracking this order id for row updates
             with ORDER_ROW_LOCK:
                 PENDING_LOG_UPDATES.pop(order_id, None)
 
         except Exception as e:
-            # Safe to ignore transient errors; background loop will retry
             print(f"Pending Order Poll Error [{order_id}]: {e}")
 
 def poll_pending_order_state():
@@ -671,7 +648,13 @@ def webhook():
                     coin_bal = new_free
                 else:
                     # Truly 0. Empty.
-                    with STATE_LOCK: BOT_STATE[symbol].update({'status': 'EMPTY', 'pending_limit': False})
+
+                    with STATE_LOCK:
+                        st = get_state(symbol)
+                        # If we’re skipping because wallet is 0, don’t rewrite HOLDING/EMPTY.
+                        # Just ensure we’re not stuck in pending_limit from old memory.
+                        st["pending_limit"] = False
+                    
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     skip_msg = f"{reason} | Skipped: Wallet 0{cancel_msg}"
                     LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
