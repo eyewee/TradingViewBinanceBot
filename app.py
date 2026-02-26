@@ -23,11 +23,19 @@ GOOGLE_CLIENT = None
 CURRENT_EXCHANGE_NAME = None
 EXCHANGE_INSTANCE = None
 
-BOT_SETTINGS = {"e2_pct": 100.0, "f2_type": "MARKET", "j2_slip": 0.0, "active_symbol": ""}
+BOT_SETTINGS = {
+    "e2_pct": 100.0,
+    "f2_type": "MARKET",
+    "j2_slip": 0.0,
+    "active_symbol": "",
+    "limit_timeout_sec": 0.0,  # F2 (seconds). 0 disables timeout
+}
+
 BOT_STATE = {}
 CACHE = {"wallet": {"USDT": 0.0}}
 STATE_LOCK = threading.Lock()
 LOG_QUEUE = []
+LOG_LOCK = threading.Lock()
 THREADS = {"logger": None, "sync": None}
 
 PENDING_LOG_UPDATES = {}   # order_id -> {"symbol":..., "row": int, "side":..., "status":...}
@@ -103,17 +111,22 @@ def normalize_symbol(user_input):
 def get_state(symbol):
     if symbol not in BOT_STATE:
         BOT_STATE[symbol] = {
-            "status": "EMPTY",          # EMPTY | HOLDING | PENDING
+            "status": "EMPTY",
             "pending_limit": False,
-            "pending_order_id": None,   # exchange order id we’re waiting on
-            "pending_side": None        # "buy" or "sell"
+            "pending_order_id": None,
+            "pending_side": None,        # "buy" or "sell"
+            "pending_ts": None,          # time.time() when limit was placed
+            "pending_quote_cost": None,  # intended USDT spend for LIMIT BUY
+            "timeout_inflight": False    # prevents double-timeout actions
         }
     else:
-        # Upgrade older dicts safely
         BOT_STATE[symbol].setdefault("status", "EMPTY")
         BOT_STATE[symbol].setdefault("pending_limit", False)
         BOT_STATE[symbol].setdefault("pending_order_id", None)
         BOT_STATE[symbol].setdefault("pending_side", None)
+        BOT_STATE[symbol].setdefault("pending_ts", None)
+        BOT_STATE[symbol].setdefault("pending_quote_cost", None)
+        BOT_STATE[symbol].setdefault("timeout_inflight", False)
     return BOT_STATE[symbol]
 
 def logger_worker_func():
@@ -121,11 +134,13 @@ def logger_worker_func():
     print("Logger Thread Started")
     while True:
          # --- MEMORY SAFETY (if google is down, don't spin eternally ---
-        if len(LOG_QUEUE) > 200:
-            LOG_QUEUE = LOG_QUEUE[-200:] # Keep only last 200 items
-            
-        if len(LOG_QUEUE) > 0:
-            task = LOG_QUEUE[0]
+        with LOG_LOCK:
+            if len(LOG_QUEUE) > 200:
+                LOG_QUEUE = LOG_QUEUE[-200:]  # Keep only last 200 items
+
+            task = LOG_QUEUE.pop(0) if len(LOG_QUEUE) > 0 else None
+
+        if task is not None:
             try:
                 sheet = get_sheet()
 
@@ -169,8 +184,6 @@ def logger_worker_func():
                     ]])
                     sheet.update(f'K{row}', [[data.get("capital", 0)]])
 
-                LOG_QUEUE.pop(0)
-
             except Exception:
                 time.sleep(5)
 
@@ -213,17 +226,17 @@ def poll_pending_order_rows():
 
             exec_price = o.get("average", o.get("price", 0)) or 0
             exec_qty = o.get("filled", 0) or 0
-
-            LOG_QUEUE.append((
-                'UPDATE_ROW',
-                {
-                    "row": row,
-                    "exec_price": exec_price,
-                    "exec_qty": exec_qty,
-                    "status": o.get("status", ""),
-                    "capital": usdt_now
-                }
-            ))
+            with LOG_LOCK:
+                LOG_QUEUE.append((
+                    'UPDATE_ROW',
+                    {
+                        "row": row,
+                        "exec_price": exec_price,
+                        "exec_qty": exec_qty,
+                        "status": o.get("status", ""),
+                        "capital": usdt_now
+                    }
+                ))
 
             # Done tracking this order id for row updates
             with ORDER_ROW_LOCK:
@@ -259,8 +272,7 @@ def poll_pending_order_state():
 
             st = str(o.get("status", "")).lower()
 
-            # Still open -> stay pending
-            if st in ("open", "new"):
+            if st in ("open", "new", "partially_filled", "partiallyfilled", "partial"):
                 continue
 
             # Terminal -> clear pending
@@ -269,6 +281,8 @@ def poll_pending_order_state():
                 s["pending_order_id"] = None
                 s["pending_side"] = None
                 s["pending_limit"] = False
+                s["pending_ts"] = None
+                s["pending_quote_cost"] = None
 
                 if st == "closed":
                     s["status"] = "HOLDING" if pside == "buy" else "EMPTY"
@@ -276,6 +290,241 @@ def poll_pending_order_state():
 
         except Exception as e:
             print(f"Pending State Poll Error [{sym} {oid}]: {e}")
+
+def handle_limit_timeouts():
+    """
+    Cancel stale LIMIT orders and convert remaining to MARKET safely.
+
+    Fixes implemented:
+      - Handles "partially_filled" (and common variants) as still-open
+      - Prevents double-actions with BOT_STATE[symbol]["timeout_inflight"]
+      - Prevents SELL oversell: cancel -> refetch -> clamp to free base -> market sell
+      - BUY conversion uses remaining QUOTE cost (intended_cost - filled_cost), not base remaining qty
+      - Does NOT force HOLDING/EMPTY; hands off to poll_pending_order_state() as the truth
+      - Logs a dedicated conversion row in the same format as webhook logs (with meta order_id mapping)
+    """
+    if not EXCHANGE_INSTANCE:
+        return
+
+    timeout_sec = safe_float(BOT_SETTINGS.get("limit_timeout_sec", 0.0), 0.0)
+    if timeout_sec <= 0:
+        return
+
+    now = time.time()
+
+    # Snapshot candidates (only LIMIT-pending)
+    with STATE_LOCK:
+        pending = [
+            (sym, st.get("pending_order_id"), st.get("pending_side"), st.get("pending_ts"))
+            for sym, st in BOT_STATE.items()
+            if st.get("pending_limit")
+            and st.get("pending_order_id")
+            and st.get("pending_side")
+            and st.get("pending_ts")
+        ]
+
+    open_like = ("open", "new", "partially_filled", "partiallyfilled", "partial")
+
+    for symbol, oid, side, ts0 in pending:
+        try:
+            # Age gate
+            if (now - float(ts0)) < float(timeout_sec):
+                continue
+
+            # Acquire inflight ownership & re-validate still same pending
+            with STATE_LOCK:
+                s = get_state(symbol)
+                if not s.get("pending_limit"):
+                    continue
+                if str(s.get("pending_order_id")) != str(oid) or str(s.get("pending_side")) != str(side):
+                    continue
+                if s.get("timeout_inflight"):
+                    continue
+                s["timeout_inflight"] = True
+
+            # Fetch current order
+            o = EXCHANGE_INSTANCE.fetch_order(oid, symbol)
+            if not o:
+                with STATE_LOCK:
+                    s = get_state(symbol)
+                    s["timeout_inflight"] = False
+                continue
+
+            st = str(o.get("status", "")).lower()
+
+            # If already resolved -> clear pending LIMIT and release inflight
+            if st not in open_like:
+                with STATE_LOCK:
+                    s = get_state(symbol)
+                    s["pending_limit"] = False
+                    s["pending_order_id"] = None
+                    s["pending_side"] = None
+                    s["pending_ts"] = None
+                    s["pending_quote_cost"] = None
+                    s["timeout_inflight"] = False
+                continue
+
+            # Cancel (best effort)
+            try:
+                EXCHANGE_INSTANCE.cancel_order(oid, symbol)
+            except Exception:
+                # Avoid cancel_all_orders() nuking unrelated orders; keep as last resort
+                try:
+                    EXCHANGE_INSTANCE.cancel_all_orders(symbol)
+                except Exception:
+                    pass
+
+            # Re-fetch after cancel to get final remaining/filled (prevents oversell)
+            try:
+                o2 = EXCHANGE_INSTANCE.fetch_order(oid, symbol) or o
+            except Exception:
+                o2 = o
+
+            remaining_base = float(o2.get("remaining", 0.0) or 0.0)
+            filled_qty = float(o2.get("filled", 0.0) or 0.0)
+
+            # If nothing left on the limit, just clear and release
+            if remaining_base <= 0:
+                with STATE_LOCK:
+                    s = get_state(symbol)
+                    s["pending_limit"] = False
+                    s["pending_order_id"] = None
+                    s["pending_side"] = None
+                    s["pending_ts"] = None
+                    s["pending_quote_cost"] = None
+                    s["timeout_inflight"] = False
+                continue
+
+            # --- Convert remainder to market ---
+            market_resp = None
+
+            if str(side).lower() == "sell":
+                # Clamp to currently-free base balance (oversell protection)
+                base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+                try:
+                    bal_now = EXCHANGE_INSTANCE.fetch_balance()
+                    free_base = float((bal_now.get("free") or {}).get(base, 0.0) or 0.0)
+                    sell_qty = max(0.0, min(remaining_base, free_base))
+                except Exception:
+                    sell_qty = max(0.0, remaining_base)
+
+                if sell_qty <= 0:
+                    with STATE_LOCK:
+                        s = get_state(symbol)
+                        s["pending_limit"] = False
+                        s["pending_order_id"] = None
+                        s["pending_side"] = None
+                        s["pending_ts"] = None
+                        s["pending_quote_cost"] = None
+                        s["timeout_inflight"] = False
+                    continue
+
+                market_resp = EXCHANGE_INSTANCE.create_order(symbol, "market", "sell", sell_qty)
+
+            else:
+                # BUY: convert remaining QUOTE cost (USDT) = intended_cost - filled_cost
+                filled_cost = float(o2.get("cost", 0.0) or 0.0)
+                if filled_cost <= 0:
+                    avg = float(o2.get("average", 0.0) or 0.0) or float(o2.get("price", 0.0) or 0.0)
+                    fqty = float(o2.get("filled", 0.0) or 0.0)
+                    if avg > 0 and fqty > 0:
+                        filled_cost = avg * fqty
+
+                with STATE_LOCK:
+                    s_local = get_state(symbol)
+                    intended_cost = float(s_local.get("pending_quote_cost") or 0.0)
+
+                rem_cost = intended_cost - filled_cost
+                if rem_cost <= 0:
+                    with STATE_LOCK:
+                        s = get_state(symbol)
+                        s["pending_limit"] = False
+                        s["pending_order_id"] = None
+                        s["pending_side"] = None
+                        s["pending_ts"] = None
+                        s["pending_quote_cost"] = None
+                        s["timeout_inflight"] = False
+                    continue
+
+                market_resp = EXCHANGE_INSTANCE.create_market_buy_order_with_cost(symbol, rem_cost)
+
+            # Refresh wallet cache so K column logs current USDT snapshot
+            base_asset = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+            refresh_wallet_cache_for_symbol(base_asset)
+
+            # Hand off truth: mark PENDING on the MARKET order id (do NOT force HOLDING/EMPTY here)
+            market_id = str(market_resp.get("id", "")) if market_resp else None
+            market_status = str((market_resp or {}).get("status", "")).lower()
+
+            with STATE_LOCK:
+                s = get_state(symbol)
+                # stop being a limit-pending order
+                s["pending_limit"] = False
+
+                # Always hand off the market order to the poller (poll is truth),
+                # even if the exchange reports it as "closed" immediately.
+                if market_id:
+                    s["status"] = "PENDING"
+                    s["pending_order_id"] = market_id
+                    s["pending_side"] = str(side).lower()
+                    s["pending_ts"] = time.time()
+                    s["pending_quote_cost"] = None
+                else:
+                    # If we somehow didn't get an id, clear pending
+                    s["pending_order_id"] = None
+                    s["pending_side"] = None
+                    s["pending_ts"] = None
+                    s["pending_quote_cost"] = None
+
+                s["timeout_inflight"] = False
+
+            # Log conversion row (same column order as webhook logging)
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conv_exec_price = (market_resp or {}).get("average", (market_resp or {}).get("price", 0)) or 0
+            conv_exec_qty = (market_resp or {}).get("filled", 0) or 0
+            conv_status = (market_resp or {}).get("status", "closed") if market_resp else "Error"
+
+            msg = (
+                f"LimitTimeout(F2={int(timeout_sec)}s): canceled {oid}, "
+                f"limit_filled={filled_qty}, limit_remaining={remaining_base}, "
+                f"converted_to_market_id={market_id or 'N/A'}"
+            )
+
+            row_data = [
+                ts,
+                symbol,
+                str(side).lower(),
+                "0%",
+                "Timeout",          # Col E (Sent/Received): label instead of a price
+                "Market",           # Col F (Calculated): market
+                conv_exec_price,    # Col G (Exec)
+                conv_exec_qty,      # Col H (Exec qty)
+                conv_status,        # Col I (Status)
+                msg,                # Col J (Reason)
+                CACHE["wallet"].get("USDT", 0.0)  # Col K (Capital)
+            ]
+
+            with LOG_LOCK:
+                LOG_QUEUE.append((
+                    "LOG",
+                    row_data,
+                    {
+                        "order_id": market_id or "",
+                        "symbol": symbol,
+                        "side": str(side).lower(),
+                        "status": conv_status
+                    }
+                ))
+
+        except Exception as e:
+            # Always release inflight on failure
+            try:
+                with STATE_LOCK:
+                    s = get_state(symbol)
+                    s["timeout_inflight"] = False
+            except Exception:
+                pass
+            print(f"Limit Timeout Error [{symbol} {oid}]: {e}")
 
 def background_sync_func():
     time.sleep(2)
@@ -297,17 +546,19 @@ def background_sync_func():
             if tick % 3 == 0 and sheet:
                 try:
                     # E2=%, G2=Type, K1=Slip, H2=Symbol (Fixed from H1)
-                    data = sheet.batch_get(['E2', 'G2', 'K1', 'H2'])
+                    data = sheet.batch_get(['E2', 'F2', 'G2', 'K1', 'H2'])
                     val_e2 = safe_float(data[0][0][0] if (len(data)>0 and data[0]) else 100)
-                    val_f2 = str(data[1][0][0]).upper() if (len(data)>1 and data[1]) else "MARKET"
-                    val_j2 = safe_float(str(data[2][0][0]).replace("%", "") if (len(data)>2 and data[2]) else 0)
-                    val_h2 = str(data[3][0][0]).strip().upper() if (len(data)>3 and data[3]) else ""
-                    
+                    val_timeout = safe_float(data[1][0][0] if (len(data)>1 and data[1]) else 0)  # F2 seconds
+                    val_f2 = str(data[2][0][0]).upper() if (len(data)>2 and data[2]) else "MARKET"
+                    val_j2 = safe_float(str(data[3][0][0]).replace("%", "") if (len(data)>3 and data[3]) else 0)
+                    val_h2 = str(data[4][0][0]).strip().upper() if (len(data)>4 and data[4]) else ""
+
                     with STATE_LOCK:
                         BOT_SETTINGS.update({
-                            'e2_pct': val_e2, 
-                            'f2_type': val_f2, 
-                            'j2_slip': val_j2, 
+                            'e2_pct': val_e2,
+                            'limit_timeout_sec': val_timeout,
+                            'f2_type': val_f2,
+                            'j2_slip': val_j2,
                             'active_symbol': val_h2
                         })
                 except Exception as e: print(f"Settings Sync Error: {e}")
@@ -341,6 +592,13 @@ def background_sync_func():
                     poll_pending_order_state()
                 except Exception as e:
                     print(f"Pending State Loop Error: {e}")
+                    
+            # 2.7. LIMIT ORDER TIMEOUTS (cancel + convert to market)
+            if tick % 1 == 0:
+                try:
+                    handle_limit_timeouts()
+                except Exception as e:
+                    print(f"Timeout Handler Error: {e}")
 
             # 3. UPDATE DASHBOARD (Every 10 seconds)
             if tick % 5 == 0 and sheet:
@@ -431,7 +689,13 @@ def special_execute():
             
             # Reset State
             with STATE_LOCK:
-                BOT_STATE[symbol] = {'status': 'EMPTY', 'pending_limit': False}
+                st = get_state(symbol)
+                st["status"] = "EMPTY"
+                st["pending_limit"] = False
+                st["pending_order_id"] = None
+                st["pending_side"] = None
+                st["pending_ts"] = None
+                st["pending_quote_cost"] = None
                 CACHE['wallet'][base] = 0.0
                 # Force immediate background sync update
                 CACHE['wallet']['USDT'] = float(bal['free'].get('USDT', 0.0))
@@ -492,7 +756,8 @@ def webhook():
         if not is_cli and side == 'buy' and st['status'] in ('HOLDING', 'PENDING'):
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             skip_msg = f"{reason} | Skipped: Already Holding or Pending"
-            LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
+            with LOG_LOCK:
+                LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
             return jsonify({"status": "skipped", "msg": skip_msg})
         
         # Pre-Trade Cleanup (Memory)
@@ -613,12 +878,15 @@ def webhook():
                     st["pending_limit"] = True
                     st["pending_order_id"] = order_id
                     st["pending_side"] = "buy"
+                    st["pending_ts"] = time.time()
+                    st["pending_quote_cost"] = float(amt_usdt)
                 else:
-                    # market order usually closed immediately
                     st["status"] = "HOLDING" if order_status == "closed" else st["status"]
                     st["pending_limit"] = False
                     st["pending_order_id"] = None
                     st["pending_side"] = None
+                    st["pending_ts"] = None
+                    st["pending_quote_cost"] = None
 
         # ==========================
         #       SELL LOGIC
@@ -657,7 +925,8 @@ def webhook():
                     
                     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     skip_msg = f"{reason} | Skipped: Wallet 0{cancel_msg}"
-                    LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
+                    with LOG_LOCK:
+                        LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
                     return jsonify({"status": "skipped", "msg": skip_msg})
 
             req_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
@@ -693,11 +962,15 @@ def webhook():
                     st["pending_limit"] = True
                     st["pending_order_id"] = order_id
                     st["pending_side"] = "sell"
+                    st["pending_ts"] = time.time()
+                    st["pending_quote_cost"] = None  # only meaningful for LIMIT BUY timeout conversion
                 else:
                     st["status"] = "EMPTY" if order_status == "closed" else st["status"]
                     st["pending_limit"] = False
                     st["pending_order_id"] = None
                     st["pending_side"] = None
+                    st["pending_ts"] = None
+                    st["pending_quote_cost"] = None
 
         # ==========================
         #       LOGGING
@@ -721,17 +994,17 @@ def webhook():
             mapped['price'], mapped['executedQty'], mapped['status'], final_reason,
             CACHE['wallet'].get('USDT')
         ]
-
-        LOG_QUEUE.append((
-            'LOG',
-            row_data,
-            {
-                "order_id": str(resp.get('id', '')) if resp else '',
-                "symbol": resp.get('symbol', symbol),
-                "side": side,
-                "status": mapped.get('status', '')
-            }
-        ))
+        with LOG_LOCK:
+            LOG_QUEUE.append((
+                'LOG',
+                row_data,
+                {
+                    "order_id": str(resp.get('id', '')) if resp else '',
+                    "symbol": resp.get('symbol', symbol),
+                    "side": side,
+                    "status": mapped.get('status', '')
+                }
+            ))
         
         return jsonify(mapped)
 
@@ -740,7 +1013,8 @@ def webhook():
         full_err = f"{reason} | {str(e)}"
         # Error Log: Use 'price' (Signal Price) since we didn't execute
         # Ensure error logs also follow the new column order
-        LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
+        with LOG_LOCK:
+            LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
         return jsonify({"status": "error", "msg": str(e), "code": 500})
 
 def brute_force_cancel(symbol=None):
