@@ -40,6 +40,7 @@ THREADS = {"logger": None, "sync": None}
 
 PENDING_LOG_UPDATES = {}   # order_id -> {"symbol":..., "row": int, "side":..., "status":...}
 ORDER_ROW_LOCK = threading.Lock()
+EXCHANGE_INIT_LOCK = threading.Lock()
 
 def load_exchange(config_name):
     global EXCHANGE_INSTANCE, CURRENT_EXCHANGE_NAME
@@ -50,6 +51,7 @@ def load_exchange(config_name):
         params = {
             'apiKey': conf.get('apiKey'),
             'secret': conf.get('secret'),
+            'timeout': 15000,  # 15s
             'options': {
                 'defaultType': 'spot',
                 # --- ENABLE GLOBAL CANCEL ---
@@ -70,8 +72,16 @@ def load_exchange(config_name):
         print(f"Exchange Load Error: {e}")
         return False
 
-if EXCHANGE_CONFIG:
-    load_exchange(list(EXCHANGE_CONFIG.keys())[0])
+def ensure_exchange_loaded():
+    global EXCHANGE_INSTANCE
+    if EXCHANGE_INSTANCE:
+        return True
+    if not EXCHANGE_CONFIG:
+        return False
+    with EXCHANGE_INIT_LOCK:
+        if EXCHANGE_INSTANCE:  # double-check under lock
+            return True
+        return load_exchange(list(EXCHANGE_CONFIG.keys())[0])
 
 def safe_float(value, default=0.0):
     try:
@@ -332,6 +342,10 @@ def handle_limit_timeouts():
     open_like = ("open", "new", "partially_filled", "partiallyfilled", "partial")
 
     for symbol, oid, side, ts0 in pending:
+        # Defaults for logging (avoid UnboundLocalError if we error before reading state)
+        pending_reason = ""
+        pending_pct = None
+        pending_log_price = None
         try:
             # Age gate
             if (now - float(ts0)) < float(timeout_sec):
@@ -347,6 +361,10 @@ def handle_limit_timeouts():
                 if s.get("timeout_inflight"):
                     continue
                 s["timeout_inflight"] = True
+                # Snapshot original intent for consistent logging
+                pending_reason = s.get("pending_reason") or ""
+                pending_pct = s.get("pending_pct")
+                pending_log_price = s.get("pending_log_price")
 
             # Fetch current order
             o = EXCHANGE_INSTANCE.fetch_order(oid, symbol)
@@ -655,6 +673,7 @@ def ensure_threads_running():
 
 @app.route('/')
 def home():
+    ensure_exchange_loaded()
     ensure_threads_running()
     return f"Bot Active. Exchange: {CURRENT_EXCHANGE_NAME}", 200
 
@@ -739,7 +758,8 @@ def webhook():
     ensure_threads_running()
     data = request.get_json(force=True)
     if data.get('passphrase') != WEBHOOK_PASSPHRASE: return jsonify({"error": "Unauthorized"}), 401
-    if not EXCHANGE_INSTANCE: return jsonify({"error": "No Exchange"}), 500
+    if not ensure_exchange_loaded():
+        return jsonify({"error": "No Exchange"}), 500
 
     symbol = normalize_symbol(data['symbol'].upper())
     side = data['side'].lower()
@@ -1097,7 +1117,8 @@ def cli():
     if m == "list_exchanges": return jsonify(list(EXCHANGE_CONFIG.keys()))
     if m == "set_exchange": return jsonify({"status": "success", "msg": f"Switched to {data.get('name')}"}) if load_exchange(data.get('name')) else jsonify({"status": "error"})
 
-    if not EXCHANGE_INSTANCE: return jsonify({"error": "No Exchange"}), 500
+    if not ensure_exchange_loaded():
+        return jsonify({"error": "No Exchange"}), 500
     try:
         if m == "account":
             b = EXCHANGE_INSTANCE.fetch_balance()
