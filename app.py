@@ -767,8 +767,9 @@ def webhook():
     price = data.get('price', 'Market')
     otype = data.get('type', 'MARKET').lower()
     reason = data.get('reason', 'Signal') 
+    log_pct = data.get('PercentAmount', data.get('percentage', 0))
 
-   # Initialize calc_p in the outer scope
+   # Initialize calc_p in the outer scope 
     calc_p = price 
     is_cli = "CLI" in reason
 
@@ -1025,7 +1026,7 @@ def webhook():
         }
         
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_pct = data.get('PercentAmount', data.get('percentage', 'Def'))
+        log_pct = data.get('PercentAmount', data.get('percentage', log_pct))
         final_reason = f"{reason}{log_retry}"
         
         # Correct Column Mapping:
