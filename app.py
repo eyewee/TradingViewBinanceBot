@@ -524,7 +524,7 @@ def handle_limit_timeouts():
                 symbol,
                 str(side).lower(),
                 "100%",
-                conv_exec_price,  # Col E: executed market price
+                (pending_log_price if pending_log_price not in (None, "", 0) else conv_exec_price),  # Col E = original received price
                 "Market",         # Col F: type marker
                 conv_exec_price,  # Col G: exec price
                 conv_exec_qty,    # Col H: exec qty
