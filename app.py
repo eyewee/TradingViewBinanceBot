@@ -170,12 +170,10 @@ def clear_entry_fill(symbol):
         st["entry_exec_price"] = None
         st["entry_exec_qty"] = None
 
-def compute_gain_pct_from_state(symbol, sell_exec_price):
-    with STATE_LOCK:
-        st = get_state(symbol)
-        entry_px = safe_float(st.get("entry_exec_price", 0) or 0)
-
+def compute_gain_pct(entry_exec_price, sell_exec_price):
+    entry_px = safe_float(entry_exec_price or 0)
     sell_px = safe_float(sell_exec_price or 0)
+
     if entry_px <= 0 or sell_px <= 0:
         return None
 
@@ -288,7 +286,10 @@ def poll_pending_order_rows():
 
             gain_pct = None
             if str(info.get("side", "")).lower() == "sell" and str(o.get("status", "")).lower() == "closed":
-                gain_pct = compute_gain_pct_from_state(symbol, exec_price)
+                with STATE_LOCK:
+                    entry_exec_price = get_state(symbol).get("entry_exec_price")
+
+                gain_pct = compute_gain_pct(entry_exec_price, exec_price)
 
             with LOG_LOCK:
                 LOG_QUEUE.append((
@@ -1074,13 +1075,13 @@ def webhook():
                     st["pending_order_id"] = order_id
                     st["pending_side"] = "sell"
                     st["pending_ts"] = time.time()
-                    st["pending_quote_cost"] = None  # only meaningful for LIMIT BUY timeout conversion
+                    st["pending_quote_cost"] = None
                     st["pending_reason"] = reason
                     st["pending_pct"] = req_pct
                     st["pending_log_price"] = log_price
                 else:
                     if order_status == "closed":
-                        gain_pct = compute_gain_pct_from_state(symbol, get_order_exec_price(resp))
+                        gain_pct = compute_gain_pct(st.get("entry_exec_price"), get_order_exec_price(resp))
 
                     st["status"] = "EMPTY" if order_status == "closed" else st["status"]
                     st["pending_limit"] = False
