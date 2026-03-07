@@ -145,6 +145,62 @@ def get_state(symbol):
         BOT_STATE[symbol].setdefault("timeout_inflight", False)
     return BOT_STATE[symbol]
 
+def maybe_write_trade_gain(sheet, row):
+    """
+    Write % gain/loss into column O for a CLOSED SELL row,
+    using the nearest previous CLOSED BUY row of the same symbol.
+
+    - Buy rows keep O empty
+    - Skipped / Error / Open rows keep O empty
+    - Uses actual executed price from column G
+    """
+    try:
+        row = int(row)
+        if row < 6:
+            return
+
+        # Read rows from B:O so we can inspect symbol/side/status/exec price
+        rows = sheet.get(f'B6:O{row}')
+        idx = row - 6
+        if idx < 0 or idx >= len(rows):
+            return
+
+        def cell(r, i, default=""):
+            return r[i] if i < len(r) else default
+
+        cur = rows[idx]
+
+        # B=symbol, C=side, G=exec price, I=status
+        cur_symbol = str(cell(cur, 0, "")).strip()
+        cur_side = str(cell(cur, 1, "")).strip().lower()
+        cur_exec = safe_float(cell(cur, 5, 0))
+        cur_status = str(cell(cur, 7, "")).strip().lower()
+
+        # Only compute on genuine executed sell rows
+        if cur_side != "sell" or cur_status != "closed" or cur_exec <= 0:
+            return
+
+        # Find nearest previous effective buy for same symbol
+        buy_exec = None
+        for prev in reversed(rows[:idx]):
+            prev_symbol = str(cell(prev, 0, "")).strip()
+            prev_side = str(cell(prev, 1, "")).strip().lower()
+            prev_exec = safe_float(cell(prev, 5, 0))
+            prev_status = str(cell(prev, 7, "")).strip().lower()
+
+            if prev_symbol == cur_symbol and prev_side == "buy" and prev_status == "closed" and prev_exec > 0:
+                buy_exec = prev_exec
+                break
+
+        if buy_exec is None or buy_exec <= 0:
+            return
+
+        gain_pct = ((cur_exec / buy_exec) - 1.0) * 100.0
+        sheet.update(f'O{row}', [[round(gain_pct, 4)]])
+
+    except Exception as e:
+        print(f"Trade Gain Log Error [row {row}]: {e}")
+
 def logger_worker_func():
     global LOG_QUEUE
     print("Logger Thread Started")
@@ -175,6 +231,9 @@ def logger_worker_func():
                     nr = max(len(col_a) + 1, 6)
                     sheet.update(f'A{nr}:K{nr}', [data])
 
+                    # If this row is a real CLOSED sell, write gain/loss into O
+                    maybe_write_trade_gain(sheet, nr)
+
                     # If this is an OPEN order, remember which sheet row belongs to which exchange order id
                     order_id = meta.get("order_id")
                     initial_status = str(meta.get("status", "")).lower()
@@ -192,13 +251,15 @@ def logger_worker_func():
                     row = int(data["row"])
 
                     # G=Exec price, H=Exec qty, I=Status, K=Capital
-                    # We can update non-adjacent ranges in 2 calls
                     sheet.update(f'G{row}:I{row}', [[
                         data.get("exec_price", 0),
                         data.get("exec_qty", 0),
                         data.get("status", "")
                     ]])
                     sheet.update(f'K{row}', [[data.get("capital", 0)]])
+
+                    # If this updated row became a real CLOSED sell, write gain/loss into O
+                    maybe_write_trade_gain(sheet, row)                    
 
             except Exception:
                 time.sleep(5)
@@ -1059,7 +1120,7 @@ def webhook():
         # Ensure error logs also follow the new column order
         with LOG_LOCK:
             LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
-        return jsonify({"status": "error", "msg": str(e), "code": 500})
+        return jsonify({"status": "error", "msg": str(e), "code": 500}), 200
 
 def brute_force_cancel(symbol=None):
     log = []
