@@ -130,7 +130,9 @@ def get_state(symbol):
             "pending_reason": None,      # strategy reason (for timeout log formatting)
             "pending_pct": None,         # requested percent (for timeout log)
             "pending_log_price": None,   # logged signal/limit price
-            "timeout_inflight": False    # prevents double-timeout actions
+            "timeout_inflight": False,   # prevents double-timeout actions
+            "entry_exec_price": None,    # actual filled buy price of current position
+            "entry_exec_qty": None       # actual filled buy qty of current position
         }
     else:
         BOT_STATE[symbol].setdefault("status", "EMPTY")
@@ -143,63 +145,41 @@ def get_state(symbol):
         BOT_STATE[symbol].setdefault("pending_pct", None)
         BOT_STATE[symbol].setdefault("pending_log_price", None)
         BOT_STATE[symbol].setdefault("timeout_inflight", False)
+        BOT_STATE[symbol].setdefault("entry_exec_price", None)
+        BOT_STATE[symbol].setdefault("entry_exec_qty", None)
     return BOT_STATE[symbol]
 
-def maybe_write_trade_gain(sheet, row):
-    """
-    Write % gain/loss into column O for a CLOSED SELL row,
-    using the nearest previous CLOSED BUY row of the same symbol.
+def get_order_exec_price(order):
+    return safe_float(order.get("average", order.get("price", 0)) or 0)
 
-    - Buy rows keep O empty
-    - Skipped / Error / Open rows keep O empty
-    - Uses actual executed price from column G
-    """
-    try:
-        row = int(row)
-        if row < 6:
-            return
+def get_order_exec_qty(order):
+    return safe_float(order.get("filled", 0) or 0)
 
-        # Read rows from B:O so we can inspect symbol/side/status/exec price
-        rows = sheet.get(f'B6:O{row}')
-        idx = row - 6
-        if idx < 0 or idx >= len(rows):
-            return
+def remember_entry_fill(symbol, order):
+    px = get_order_exec_price(order)
+    qty = get_order_exec_qty(order)
+    if px > 0 and qty > 0:
+        with STATE_LOCK:
+            st = get_state(symbol)
+            st["entry_exec_price"] = px
+            st["entry_exec_qty"] = qty
 
-        def cell(r, i, default=""):
-            return r[i] if i < len(r) else default
+def clear_entry_fill(symbol):
+    with STATE_LOCK:
+        st = get_state(symbol)
+        st["entry_exec_price"] = None
+        st["entry_exec_qty"] = None
 
-        cur = rows[idx]
+def compute_gain_pct_from_state(symbol, sell_exec_price):
+    with STATE_LOCK:
+        st = get_state(symbol)
+        entry_px = safe_float(st.get("entry_exec_price", 0) or 0)
 
-        # B=symbol, C=side, G=exec price, I=status
-        cur_symbol = str(cell(cur, 0, "")).strip()
-        cur_side = str(cell(cur, 1, "")).strip().lower()
-        cur_exec = safe_float(cell(cur, 5, 0))
-        cur_status = str(cell(cur, 7, "")).strip().lower()
+    sell_px = safe_float(sell_exec_price or 0)
+    if entry_px <= 0 or sell_px <= 0:
+        return None
 
-        # Only compute on genuine executed sell rows
-        if cur_side != "sell" or cur_status != "closed" or cur_exec <= 0:
-            return
-
-        # Find nearest previous effective buy for same symbol
-        buy_exec = None
-        for prev in reversed(rows[:idx]):
-            prev_symbol = str(cell(prev, 0, "")).strip()
-            prev_side = str(cell(prev, 1, "")).strip().lower()
-            prev_exec = safe_float(cell(prev, 5, 0))
-            prev_status = str(cell(prev, 7, "")).strip().lower()
-
-            if prev_symbol == cur_symbol and prev_side == "buy" and prev_status == "closed" and prev_exec > 0:
-                buy_exec = prev_exec
-                break
-
-        if buy_exec is None or buy_exec <= 0:
-            return
-
-        gain_pct = ((cur_exec / buy_exec) - 1.0) * 100.0
-        sheet.update(f'O{row}', [[round(gain_pct, 4)]])
-
-    except Exception as e:
-        print(f"Trade Gain Log Error [row {row}]: {e}")
+    return round(((sell_px / entry_px) - 1.0) * 100.0, 4)
 
 def logger_worker_func():
     global LOG_QUEUE
@@ -231,8 +211,9 @@ def logger_worker_func():
                     nr = max(len(col_a) + 1, 6)
                     sheet.update(f'A{nr}:K{nr}', [data])
 
-                    # If this row is a real CLOSED sell, write gain/loss into O
-                    maybe_write_trade_gain(sheet, nr)
+                    gain_pct = meta.get("gain_pct")
+                    if gain_pct not in (None, "", "None"):
+                        sheet.update(f'O{nr}', [[gain_pct]])
 
                     # If this is an OPEN order, remember which sheet row belongs to which exchange order id
                     order_id = meta.get("order_id")
@@ -247,7 +228,7 @@ def logger_worker_func():
                             }
 
                 elif task_type == 'UPDATE_ROW':
-                    # data = {"row":int, "exec_price":..., "exec_qty":..., "status":..., "capital":...}
+                    # data = {"row":int, "exec_price":..., "exec_qty":..., "status":..., "capital":..., "gain_pct":...}
                     row = int(data["row"])
 
                     # G=Exec price, H=Exec qty, I=Status, K=Capital
@@ -258,8 +239,9 @@ def logger_worker_func():
                     ]])
                     sheet.update(f'K{row}', [[data.get("capital", 0)]])
 
-                    # If this updated row became a real CLOSED sell, write gain/loss into O
-                    maybe_write_trade_gain(sheet, row)                    
+                    gain_pct = data.get("gain_pct")
+                    if gain_pct not in (None, "", "None"):
+                        sheet.update(f'O{row}', [[gain_pct]])            
 
             except Exception:
                 time.sleep(5)
@@ -303,6 +285,11 @@ def poll_pending_order_rows():
 
             exec_price = o.get("average", o.get("price", 0)) or 0
             exec_qty = o.get("filled", 0) or 0
+
+            gain_pct = None
+            if str(info.get("side", "")).lower() == "sell" and str(o.get("status", "")).lower() == "closed":
+                gain_pct = compute_gain_pct_from_state(symbol, exec_price)
+
             with LOG_LOCK:
                 LOG_QUEUE.append((
                     'UPDATE_ROW',
@@ -311,7 +298,8 @@ def poll_pending_order_rows():
                         "exec_price": exec_price,
                         "exec_qty": exec_qty,
                         "status": o.get("status", ""),
-                        "capital": usdt_now
+                        "capital": usdt_now,
+                        "gain_pct": gain_pct
                     }
                 ))
 
@@ -352,17 +340,29 @@ def poll_pending_order_state():
             if st in ("open", "new", "partially_filled", "partiallyfilled", "partial"):
                 continue
 
-            # Terminal -> clear pending
+            # Terminal -> update state from exchange truth, then clear pending
             with STATE_LOCK:
                 s = get_state(sym)
+
+                if st == "closed":
+                    exec_price = get_order_exec_price(o)
+                    exec_qty = get_order_exec_qty(o)
+
+                    if pside == "buy" and exec_price > 0 and exec_qty > 0:
+                        s["entry_exec_price"] = exec_price
+                        s["entry_exec_qty"] = exec_qty
+                        s["status"] = "HOLDING"
+
+                    elif pside == "sell":
+                        s["status"] = "EMPTY"
+                        s["entry_exec_price"] = None
+                        s["entry_exec_qty"] = None
+
                 s["pending_order_id"] = None
                 s["pending_side"] = None
                 s["pending_limit"] = False
                 s["pending_ts"] = None
                 s["pending_quote_cost"] = None
-
-                if st == "closed":
-                    s["status"] = "HOLDING" if pside == "buy" else "EMPTY"
                 # canceled/rejected/expired: keep previous status, just not pending
 
         except Exception as e:
@@ -572,6 +572,10 @@ def handle_limit_timeouts():
             conv_exec_qty = (market_resp or {}).get("filled", 0) or 0
             conv_status = (market_resp or {}).get("status", "closed") if market_resp else "Error"
 
+            gain_pct = None
+            if str(side).lower() == "sell" and str(conv_status).lower() == "closed":
+                gain_pct = compute_gain_pct_from_state(symbol, conv_exec_price)
+
             msg = (
                 f"{pending_reason} | Timeout={int(timeout_sec)}S"
                 f" | canceled {oid}"
@@ -602,7 +606,8 @@ def handle_limit_timeouts():
                         "order_id": market_id or "",
                         "symbol": symbol,
                         "side": str(side).lower(),
-                        "status": conv_status
+                        "status": conv_status,
+                        "gain_pct": gain_pct
                     }
                 ))
 
@@ -787,6 +792,8 @@ def special_execute():
                 st["pending_side"] = None
                 st["pending_ts"] = None
                 st["pending_quote_cost"] = None
+                st["entry_exec_price"] = None
+                st["entry_exec_qty"] = None
                 CACHE['wallet'][base] = 0.0
                 # Force immediate background sync update
                 CACHE['wallet']['USDT'] = float(bal['free'].get('USDT', 0.0))
@@ -872,6 +879,7 @@ def webhook():
         resp = {}
         log_retry = ""
         log_price = price
+        gain_pct = None
 
         # --- BULLETPROOF WRAPPER ---
         def safe_execute(action_func, is_buy):
@@ -987,6 +995,10 @@ def webhook():
                     st["pending_pct"] = None
                     st["pending_log_price"] = None
 
+                    if order_status == "closed":
+                        st["entry_exec_price"] = get_order_exec_price(resp)
+                        st["entry_exec_qty"] = get_order_exec_qty(resp)
+
         # ==========================
         #       SELL LOGIC
         # ==========================
@@ -1067,6 +1079,9 @@ def webhook():
                     st["pending_pct"] = req_pct
                     st["pending_log_price"] = log_price
                 else:
+                    if order_status == "closed":
+                        gain_pct = compute_gain_pct_from_state(symbol, get_order_exec_price(resp))
+
                     st["status"] = "EMPTY" if order_status == "closed" else st["status"]
                     st["pending_limit"] = False
                     st["pending_order_id"] = None
@@ -1076,6 +1091,10 @@ def webhook():
                     st["pending_reason"] = None
                     st["pending_pct"] = None
                     st["pending_log_price"] = None
+
+                    if order_status == "closed":
+                        st["entry_exec_price"] = None
+                        st["entry_exec_qty"] = None
 
         # ==========================
         #       LOGGING
@@ -1107,7 +1126,8 @@ def webhook():
                     "order_id": str(resp.get('id', '')) if resp else '',
                     "symbol": resp.get('symbol', symbol),
                     "side": side,
-                    "status": mapped.get('status', '')
+                    "status": mapped.get('status', ''),
+                    "gain_pct": gain_pct
                 }
             ))
         
