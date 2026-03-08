@@ -177,7 +177,8 @@ def compute_gain_pct(entry_exec_price, sell_exec_price):
     if entry_px <= 0 or sell_px <= 0:
         return None
 
-    return round(((sell_px / entry_px) - 1.0) * 100.0, 4)
+    # Return fraction for Google Sheets percent-formatted cell
+    return round((sell_px / entry_px) - 1.0, 6)
 
 def logger_worker_func():
     global LOG_QUEUE
@@ -575,7 +576,10 @@ def handle_limit_timeouts():
 
             gain_pct = None
             if str(side).lower() == "sell" and str(conv_status).lower() == "closed":
-                gain_pct = compute_gain_pct_from_state(symbol, conv_exec_price)
+                with STATE_LOCK:
+                    entry_exec_price = get_state(symbol).get("entry_exec_price")
+
+                gain_pct = compute_gain_pct(entry_exec_price, conv_exec_price)
 
             msg = (
                 f"{pending_reason} | Timeout={int(timeout_sec)}S"
