@@ -834,6 +834,8 @@ def webhook():
     if not ensure_exchange_loaded():
         return jsonify({"error": "No Exchange"}), 500
 
+    if "CLI" in data.get('reason', ''):
+        return _process_webhook(data)
     threading.Thread(target=_process_webhook, args=(data,), daemon=True).start()
     return jsonify({"status": "accepted"}), 200
 
@@ -1048,7 +1050,7 @@ def _process_webhook(data):
                     skip_msg = f"{reason} | Skipped: Wallet 0{cancel_msg}"
                     with LOG_LOCK:
                         LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
-                    return
+                    return jsonify({"status": "skipped", "msg": skip_msg})
 
             req_pct = float(data.get('PercentAmount', data.get('percentage', 100)))
             qty = float(data.get('quantity', 0))
@@ -1141,7 +1143,7 @@ def _process_webhook(data):
                 }
             ))
         
-        return
+        return jsonify(mapped)
 
     except Exception as e:
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1150,7 +1152,7 @@ def _process_webhook(data):
         # Ensure error logs also follow the new column order
         with LOG_LOCK:
             LOG_QUEUE.append(('LOG', [ts, symbol, side, f"{log_pct}%", price, calc_p, 0, 0, "Error", full_err, CACHE['wallet'].get('USDT', 0)]))
-        return
+        return jsonify({"status": "error", "msg": str(e), "code": 500}), 200
 
 def brute_force_cancel(symbol=None):
     log = []
