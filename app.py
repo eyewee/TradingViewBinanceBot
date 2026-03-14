@@ -836,7 +836,7 @@ def webhook():
 
     if "CLI" in data.get('reason', ''):
         return _process_webhook(data)
-    threading.Thread(target=_process_webhook, args=(data,), daemon=True).start()
+    threading.Thread(target=lambda: app.app_context().push() or _process_webhook(data), daemon=True).start()
     return jsonify({"status": "accepted"}), 200
 
 def _process_webhook(data):
