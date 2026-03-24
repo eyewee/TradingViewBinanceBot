@@ -18,7 +18,7 @@ you can basically execute trades directly from the CLI through the API key, with
     *   **Advanced Limit Timeout**: If a limit order doesn't fill within a specified time (e.g., 60s), the bot auto-cancels it and buys/sells the remainder at Market price.
     *   **Slippage Calculation**: Automatically adjusts Limit order prices based on your defined slippage tolerance.
 *   **Remote CLI (`commander.py`)**: Execute trades from your terminal anywhere. Supports smart inputs (e.g., `buy BTC/USDT 50%` (50% -> 50% of your capital) or `buy BTC/USDT $100` etc.).
-*   **Panic Mode 🚨**: Market tanking? Trigger a "Panic" via the CLI or hidden web UI to instantly force-cancel open limit orders and market-sell your holdings (page available at your-deployed-bot.onrender.com/special)
+*   **Panic Mode 🚨**: Market tanking? Trigger a "Panic" via the CLI or hidden web UI to instantly force-cancel open limit orders and market-sell your holdings (page available at `your-bot-name.onrender.com/special`)
 
 ---
 
@@ -112,24 +112,19 @@ To trigger the bot from your TradingView strategies, you need to set up your Pin
 Here is an example of an alert function you can embed in your Pine Script:
 
 ```pine
-f_fire_alert(string _id, float _price, string _side, int _mode) =>
+f_fire_alert(string _id, float _price, string _side) =>
     bool sent = false
     
     // Check Lock (Index 0): Have we already fired on this specific bar index?
     if array.get(g_alert_state, 0) != bar_index
-        string modeTag = _mode == MODE_TICK ? "(Rt)" : _mode == MODE_ANTICIPATE ? "(Antic.)" : "(Close)"
-        
+    
         // Construct the JSON payload required by the bot
-        string msg = '{"reason": "' + _id + ' ' + modeTag + '", "price": "' + str.tostring(_price, format.mintick) + '", "passphrase": "SuperSecretBotKey123", "symbol": "' + syminfo.ticker + '", "side": "' + _side + '", "percentage": 100}'
+        string msg = '{"reason": "' + _id, "price": "' + str.tostring(_price, format.mintick) + '", "passphrase": "SuperSecretBotKey123", "symbol": "' + syminfo.ticker + '", "side": "' + _side + '", "percentage": 100}'
         
         // Fire the alert
-        alert(msg, alert.freq_all)
-        
-        // Lock this bar index (Index 0) and Set Visual Flag (Index 1)
-        array.set(g_alert_state, 0, bar_index)
-        array.set(g_alert_state, 1, 1)
+        alert(msg, alert.freq_all)  
         sent := true
-    
+        
     sent
 ```
 
