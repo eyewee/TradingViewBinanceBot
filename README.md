@@ -1,5 +1,5 @@
 
-# 📈 FREE Lightweight TradingView to Crypto Exchange Bot (with Google Sheets Logging)
+# 📈 FREE + Lightweight TradingView to Crypto Exchange Bot (with Google Sheets Logging) + complete CLI integration
 
 This is a robust, fully automated bridge between TradingView alerts and cryptocurrency exchanges. Powered by Python, Flask, and the massive [CCXT Library](https://github.com/ccxt/ccxt), this bot supports **any crypto exchange (main and testnets) supported by ccxt library**.
 
