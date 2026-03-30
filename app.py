@@ -569,7 +569,7 @@ def handle_limit_timeouts():
                 s["timeout_inflight"] = False
 
             # Log conversion row (same column order as webhook logging)
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
             conv_exec_price = (market_resp or {}).get("average", (market_resp or {}).get("price", 0)) or 0
             conv_exec_qty = (market_resp or {}).get("filled", 0) or 0
             conv_status = (market_resp or {}).get("status", "closed") if market_resp else "Error"
@@ -709,7 +709,7 @@ def background_sync_func():
                         active_sym = BOT_SETTINGS.get('active_symbol', '').upper()
 
                     usdt_val = current_wallet.get('USDT', 0.0)
-                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
                     
                     # Update A2 (Time) and B2 (USDT Balance)
                     sheet.update('A2:B2', [[ts, usdt_val]])
@@ -873,7 +873,7 @@ def _process_webhook(data):
         # State Check (Memory)
         st = get_state(symbol)
         if not is_cli and side == 'buy' and st['status'] in ('HOLDING', 'PENDING'):
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
             skip_msg = f"{reason} | Skipped: Already Holding or Pending"
             with LOG_LOCK:
                 LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
@@ -1053,7 +1053,7 @@ def _process_webhook(data):
                         # Just ensure we’re not stuck in pending_limit from old memory.
                         st["pending_limit"] = False
                     
-                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
                     skip_msg = f"{reason} | Skipped: Wallet 0{cancel_msg}"
                     with LOG_LOCK:
                         LOG_QUEUE.append(('LOG', [ts, symbol, side, "0%", price, "", 0, 0, "Skipped", skip_msg, CACHE['wallet'].get('USDT', 0)]))
@@ -1124,7 +1124,7 @@ def _process_webhook(data):
             "cummulativeQuoteQty": resp.get('cost', 0), "price": resp.get('average', resp.get('price', 0))
         }
         
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
         log_pct = data.get('PercentAmount', data.get('percentage', log_pct))
         final_reason = f"{reason}{log_retry}"
         
@@ -1153,7 +1153,7 @@ def _process_webhook(data):
         return mapped
 
     except Exception as e:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = (datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
         full_err = f"{reason} | {str(e)}"
         # Error Log: Use 'price' (Signal Price) since we didn't execute
         # Ensure error logs also follow the new column order
