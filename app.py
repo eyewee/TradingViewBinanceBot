@@ -744,9 +744,12 @@ def ensure_threads_running():
 
 @app.route('/')
 def home():
-    ensure_exchange_loaded()
     ensure_threads_running()
     return f"Bot Active. Exchange: {CURRENT_EXCHANGE_NAME}", 200
+
+@app.route('/health')
+def health():
+    return "ok", 200
 
 @app.route('/special')
 def special_ui():
